@@ -169,3 +169,14 @@ if __name__ == "__main__":
     main()
 
 s3://cx-speech/asr-realtime/benchmarking-data-3/
+
+I went through the email from Prakruthi, and I think she has shared the relevant documentations, although I did not go through them all yet.
+ 
+I have not explored NIM though, so I am not sure how that will work out compared to our custom deployments.
+ 
+Also, I have included barge-in in our roadmap.
+ 
+ok , if you think we should 1-2 days until you both go though that documentation ,we can wait
+ 
+yah, I can through NIM in more details.  Maybe we can ask her for some sample code for silero+nemotron with (and without) barge-in to save us some time.
+ 
