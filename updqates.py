@@ -170,6 +170,6 @@ if __name__ == "__main__":
 
 s3://cx-speech/asr-realtime/benchmarking-data-3/
 
-Agree — let’s take 1–2 days to review the NIM and scaling details properly.
+Agree — let’s take 1–2 days to review this in detail.
 
-Since Nemotron requires external VAD for barge-in, getting a Silero + Nemotron sample (with/without barge-in) will help us validate real-time behavior faster. I’ll also compare NIM vs our current deployment from a latency standpoint.
+Since NIM deployment for Nemotron Streaming isn’t available yet, I think we should focus first on validating Silero + Nemotron behavior (with/without barge-in) in our current setup. Once NIM is released, we can evaluate it for scaling and production optimization.
