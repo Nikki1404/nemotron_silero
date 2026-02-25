@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+numpy
+omegaconf
+websockets
+nemo_toolkit[asr]
