@@ -170,55 +170,6 @@ if __name__ == "__main__":
 
 s3://cx-speech/asr-realtime/benchmarking-data-3/
 
-Hi @Ashutosh Sidana,
+Agree — let’s take 1–2 days to review the NIM and scaling details properly.
 
-      Thanks for reaching out, please find my responses below.
-1. Nemotron-Speech-Streaming: LiveKit & Telephony Integration
-LiveKit Plugin / WebSocket Integration
-Yes, we support WebSocket-based streaming through our pipeline integration framework. You can find implementation details and examples here:
-
-https://github.com/modal-projects/modal-nvidia-asr/tree/main
-
-https://docs.nvidia.com/nim/riva/asr/latest/realtime-asr.html#websocket-connection-details
-
-This demonstrates how to integrate real-time ASR streaming using WebSockets.
-
-Barge-In / Interruption Handling
-Nemotron-Speech-Streaming is an ASR model and does not include built-in turn detection or barge-in handling. A separate VAD (Voice Activity Detection) model should be integrated (e.g., Silero or WebRTC VAD) to manage interruptions and conversational turn-taking logic.
-
-Telephony Audio (8 kHz, μ-law/A-law)
-Nemotron-Speech-Streaming currently supports 16 kHz audio. If 8 kHz audio is provided (e.g., telephony), it is automatically upsampled to 16 kHz internally. However, best practice is to ensure proper decoding (μ-law/A-law to PCM) before ingestion.
-
-2. Production Scaling & GPU Requirements
-GPU Requirements & Benchmarks
-Please refer to the following blog, which provides detailed benchmarking and scaling guidance (streams per GPU, performance characteristics, etc.):
-https://huggingface.co/blog/nvidia/nemotron-speech-asr-scaling-voice-agents
-
-NIM / Triton Optimizations
-Model availability and deployment configurations for NVIDIA NIM and Triton Inference Server can be found in the official model support documentation.
-
-Enterprise Support / SLA
-Yes, enterprise SLA support is available through NVIDIA AI Enterprise (NVAIE) licensing.
-
-Production Deployment Best Practices
-NIM deployment capability for Nemotron-Speech-Streaming will be available shortly, with an ETA of mid-March. Detailed deployment documentation will accompany the release.
-
-3. PersonaPlex: Tool Calling & Guardrails
-PersonaPlex is currently a full-duplex speech-to-speech (S2S) model.
-
-If your use case requires:
-
-Tool/function calling (e.g., CRM lookups, order status APIs)
-
-Custom guardrails (jailbreak detection, PII redaction, output validation)
-
-Framework integrations (e.g., orchestration with Google ADK or LangGraph)
-
-We recommend Nemotron Voice Chat (early access), which includes support for tool calling, guardrails integration, and broader framework compatibility.
-
-4. Roadmap & Architecture
-Multi-language support details and roadmap updates are included in the latest model capability documentation (attached snippet).
-
-For low-latency end-to-end voice agents, NVIDIA TTS models available via NIM pair well with Nemotron-Speech-Streaming.
-
-Nemotron-Speech-Streaming can absolutely be used as a modular ASR component while retaining your own LLM (e.g., ADK/Gemini) for orchestration. It does not require tight coupling with PersonaPlex or Canopy and supports flexible architecture patterns.
+Since Nemotron requires external VAD for barge-in, getting a Silero + Nemotron sample (with/without barge-in) will help us validate real-time behavior faster. I’ll also compare NIM vs our current deployment from a latency standpoint.
