@@ -62,21 +62,42 @@ app.include_router(router)
 # client.py-
 
 from openai import OpenAI
+import numpy as np
+import soundfile as sf
 
 client = OpenAI(
     base_url="https://tts-kokoro-openapi-150916788856.europe-west1.run.app/v1/tts",
-    #base_url="http://127.0.0.1:8080/v1/tts",
     api_key="not-needed",
 )
 
+pcm_path = "output.pcm"
+wav_path = "output.wav"
+
+# 1️⃣ Save PCM
 with client.audio.speech.with_streaming_response.create(
     model="",
     voice="",
     input="Hello world from kokoro openapi deployed on gcp without docker testing",
 ) as resp:
-    resp.stream_to_file("output.mp3")
 
-print("Saved -> output.mp3")
+    with open(pcm_path, "wb") as f:
+        for chunk in resp.iter_bytes():
+            f.write(chunk)
+
+print("Saved -> output.pcm")
+
+# 2️⃣ Convert PCM → WAV
+with open(pcm_path, "rb") as f:
+    pcm_data = f.read()
+
+audio = np.frombuffer(pcm_data, dtype=np.int16)
+
+# Convert to float32 range (-1 to 1) for WAV writing
+audio_float = audio.astype(np.float32) / 32767.0
+
+sf.write(wav_path, audio_float, 24000, format="WAV")
+
+print("Converted -> output.wav")
 
 #Dockerfile-
 FROM python:3.12-slim
