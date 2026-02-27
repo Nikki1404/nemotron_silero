@@ -1,74 +1,97 @@
 import asyncio
 import json
-import sys
 import time
-
 import numpy as np
 import sounddevice as sd
 import websockets
 
+WS_URL = "ws://127.0.0.1:8000/ws"  # change to EC2 public IP if needed
 SR = 16000
-CHUNK_MS = 80
-CHUNK_SAMPLES = int(SR * CHUNK_MS / 1000)
+BLOCK_MS = 40
+BLOCK_SAMPLES = int(SR * BLOCK_MS / 1000)
 
-# Change to: ws://EC2_PUBLIC_IP:8000/ws
-WS_URL = "ws://127.0.0.1:8000/ws"
+def rms_db(x: np.ndarray) -> float:
+    rms = float(np.sqrt(np.mean(x * x) + 1e-12))
+    return 20.0 * np.log10(rms + 1e-12)
 
+async def receiver(ws):
+    try:
+        while True:
+            msg = await ws.recv()
+            obj = json.loads(msg)
+
+            if obj.get("type") == "partial":
+                print("\r" + obj.get("text", ""), end="", flush=True)
+            elif obj.get("type") == "final":
+                print("\n[FINAL] " + obj.get("text", ""))
+            elif obj.get("type") == "error":
+                print("\n[ERROR] " + obj.get("message", ""))
+    except websockets.exceptions.ConnectionClosed:
+        print("\n[INFO] Connection closed.")
 
 async def run():
-    async with websockets.connect(WS_URL, max_size=2**24) as ws:
-        loop = asyncio.get_running_loop()
+    print("🎙️ Speak now... Ctrl+C to stop")
 
-        last_line = ""
-        last_print = 0.0
+    loop = asyncio.get_running_loop()
+    send_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+
+    async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+        recv_task = asyncio.create_task(receiver(ws))
+
+        async def sender():
+            try:
+                while True:
+                    data = await send_q.get()
+                    await ws.send(data)
+            except asyncio.CancelledError:
+                return
+
+        send_task = asyncio.create_task(sender())
+
+        last_lvl = 0.0
 
         def callback(indata, frames, time_info, status):
+            nonlocal last_lvl
             if status:
+                # status can include underflow/overflow warnings
                 pass
-            x = np.clip(indata[:, 0], -1.0, 1.0)
-            pcm16 = (x * 32767.0).astype(np.int16)
-            # send raw PCM16 bytes
-            loop.call_soon_threadsafe(asyncio.create_task, ws.send(pcm16.tobytes()))
 
-        print("🎙️ Speak now... Ctrl+C to stop")
-        with sd.InputStream(
+            mono = indata[:, 0].astype(np.float32)
+
+            now = time.time()
+            if now - last_lvl >= 1.0:
+                last_lvl = now
+                lvl = rms_db(mono)
+                # Print mic level occasionally so you know audio is flowing
+                loop.call_soon_threadsafe(lambda: print(f"\n[MIC] level={lvl:.1f} dB", end=""))
+
+            pcm16 = (np.clip(mono, -1.0, 1.0) * 32767.0).astype(np.int16)
+            payload = pcm16.tobytes()
+
+            # Thread-safe enqueue into asyncio queue
+            def _enqueue():
+                if not send_q.full():
+                    send_q.put_nowait(payload)
+            loop.call_soon_threadsafe(_enqueue)
+
+        stream = sd.InputStream(
             samplerate=SR,
             channels=1,
             dtype="float32",
-            blocksize=CHUNK_SAMPLES,
+            blocksize=BLOCK_SAMPLES,
             callback=callback,
-        ):
-            while True:
-                msg = await ws.recv()
-                obj = json.loads(msg)
-                t = obj.get("type")
+        )
 
-                if t == "partial":
-                    txt = obj.get("text", "")
-                    # keep console smooth
-                    now = time.time()
-                    if txt != last_line or (now - last_print) > 0.2:
-                        sys.stdout.write("\r" + txt + " " * 20)
-                        sys.stdout.flush()
-                        last_line = txt
-                        last_print = now
-
-                elif t == "final":
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    print("[FINAL]", obj.get("text", ""))
-
-                elif t == "warn":
-                    # optional
-                    pass
-
-                elif t == "error":
-                    print("[ERROR]", obj.get("message", "unknown"))
-                    break
-
+        try:
+            with stream:
+                while True:
+                    await asyncio.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            recv_task.cancel()
+            send_task.cancel()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    asyncio.run(run())
+
