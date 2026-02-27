@@ -1,59 +1,155 @@
-      pruning_mode: LATE
-      allow_cuda_graphs: true
-      tsd_max_sym_exp: 50
-    temperature: 1.0
-    durations: []
-    big_blank_durations: []
+import asyncio
+import json
+import time
+from dataclasses import dataclass
+from typing import Optional
 
-[INIT] Warming up model...
-Traceback (most recent call last):
-  File "/usr/local/bin/uvicorn", line 6, in <module>
-    sys.exit(main())
-  File "/usr/local/lib/python3.10/dist-packages/click/core.py", line 1485, in __call__
-    return self.main(*args, **kwargs)
-  File "/usr/local/lib/python3.10/dist-packages/click/core.py", line 1406, in main
-    rv = self.invoke(ctx)
-  File "/usr/local/lib/python3.10/dist-packages/click/core.py", line 1269, in invoke
-    return ctx.invoke(self.callback, **ctx.params)
-  File "/usr/local/lib/python3.10/dist-packages/click/core.py", line 824, in invoke
-    return callback(*args, **kwargs)
-  File "/usr/local/lib/python3.10/dist-packages/uvicorn/main.py", line 433, in main
-    run(
-  File "/usr/local/lib/python3.10/dist-packages/uvicorn/main.py", line 606, in run
-    server.run()
-  File "/usr/local/lib/python3.10/dist-packages/uvicorn/server.py", line 75, in run
-    return asyncio_run(self.serve(sockets=sockets), loop_factory=self.config.get_loop_factory())
-  File "/usr/local/lib/python3.10/dist-packages/uvicorn/_compat.py", line 60, in asyncio_run
-    return loop.run_until_complete(main)
-  File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
-  File "/usr/local/lib/python3.10/dist-packages/uvicorn/server.py", line 79, in serve
-    await self._serve(sockets)
-  File "/usr/local/lib/python3.10/dist-packages/uvicorn/server.py", line 86, in _serve
-    config.load()
-  File "/usr/local/lib/python3.10/dist-packages/uvicorn/config.py", line 441, in load
-    self.loaded_app = import_from_string(self.app)
-  File "/usr/local/lib/python3.10/dist-packages/uvicorn/importer.py", line 19, in import_from_string
-    module = importlib.import_module(module_str)
-  File "/usr/lib/python3.10/importlib/__init__.py", line 126, in import_module
-    return _bootstrap._gcd_import(name[level:], package, level)
-  File "<frozen importlib._bootstrap>", line 1050, in _gcd_import
-  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
-  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
-  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
-  File "<frozen importlib._bootstrap_external>", line 883, in exec_module
-  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
-  File "/app/server.py", line 180, in <module>
-    asr = NemotronStreamer()
-  File "/app/server.py", line 98, in __init__
-    self.stream_step(dummy)
-  File "/app/server.py", line 116, in stream_step
-    processed_signal, processed_signal_length = self.preprocessor(audio_signal, audio_len)
-  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1747, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/usr/local/lib/python3.10/dist-packages/nemo/core/classes/common.py", line 1192, in wrapped_call
-    raise TypeError("All arguments must be passed by kwargs only for typed methods")
-TypeError: All arguments must be passed by kwargs only for typed methods
-(base) root@EC03-E01-AICOE1:/home/CORP/re_nikitav/nemotron_silero#
-                                                      getting this while docker run now 
+import numpy as np
+import torch
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+import nemo.collections.asr as nemo_asr
+
+# ===============================
+# DEBUG FLAGS
+# ===============================
+DEBUG_AUDIO = True
+DEBUG_VAD = True
+DEBUG_ASR = True
+
+# ===============================
+# CONFIG
+# ===============================
+SR = 16000
+ASR_CHUNK_MS = 160
+ASR_CHUNK_SAMPLES = int(SR * ASR_CHUNK_MS / 1000)
+
+VAD_FRAME_SAMPLES = 512
+VAD_START_TH = 0.6
+VAD_END_TH = 0.35
+MIN_SILENCE_MS = 400
+
+MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+app = FastAPI()
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "device": DEVICE}
+
+
+# ===============================
+# Load Nemotron (Built-In Streaming)
+# ===============================
+print("[INIT] Loading Nemotron...")
+asr_model = nemo_asr.models.ASRModel.from_pretrained(
+    model_name=MODEL_NAME
+).to(DEVICE).eval()
+
+print("[INIT] Nemotron ready.")
+
+
+# ===============================
+# Load Silero VAD
+# ===============================
+print("[INIT] Loading Silero VAD...")
+vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
+vad_model.to("cpu").eval()
+
+
+def silero_prob(frame):
+    audio = frame.astype(np.float32) / 32768.0
+    with torch.no_grad():
+        return float(vad_model(torch.from_numpy(audio), SR).item())
+
+
+@dataclass
+class VADState:
+    speaking: bool = False
+    silence_ms: int = 0
+
+
+# ===============================
+# WebSocket
+# ===============================
+@app.websocket("/ws")
+async def ws_asr(ws: WebSocket):
+    await ws.accept()
+
+    vad_state = VADState()
+    vad_buf = np.zeros((0,), dtype=np.int16)
+    asr_buf = np.zeros((0,), dtype=np.int16)
+
+    try:
+        while True:
+            data = await ws.receive_bytes()
+
+            if DEBUG_AUDIO:
+                print(f"[AUDIO] {len(data)} bytes")
+
+            chunk = np.frombuffer(data, dtype=np.int16)
+
+            vad_buf = np.concatenate([vad_buf, chunk])
+            asr_buf = np.concatenate([asr_buf, chunk])
+
+            end_utt = False
+
+            # ===============================
+            # VAD PROCESS
+            # ===============================
+            while len(vad_buf) >= VAD_FRAME_SAMPLES:
+                frame = vad_buf[:VAD_FRAME_SAMPLES]
+                vad_buf = vad_buf[VAD_FRAME_SAMPLES:]
+
+                p = silero_prob(frame)
+
+                if DEBUG_VAD:
+                    print(f"[VAD] prob={p:.3f}")
+
+                if not vad_state.speaking:
+                    if p >= VAD_START_TH:
+                        vad_state.speaking = True
+                        print("[VAD] SPEECH START")
+                else:
+                    if p <= VAD_END_TH:
+                        vad_state.speaking = False
+                        end_utt = True
+                        print("[VAD] SPEECH END")
+
+            # ===============================
+            # ASR PROCESS (Built-In Streaming)
+            # ===============================
+            if vad_state.speaking:
+                while len(asr_buf) >= ASR_CHUNK_SAMPLES:
+                    chunk = asr_buf[:ASR_CHUNK_SAMPLES]
+                    asr_buf = asr_buf[ASR_CHUNK_SAMPLES:]
+
+                    audio_f32 = chunk.astype(np.float32) / 32768.0
+
+                    with torch.no_grad():
+                        result = asr_model.streaming_transcribe(
+                            audio=[audio_f32],
+                            sample_rate=SR,
+                        )
+
+                    text = result[0] if result else ""
+
+                    if DEBUG_ASR:
+                        print(f"[ASR] TEXT: '{text}'")
+
+                    if text:
+                        await ws.send_text(
+                            json.dumps({"type": "partial", "text": text})
+                        )
+
+            if end_utt:
+                print("[FINAL]")
+                await ws.send_text(
+                    json.dumps({"type": "final", "text": ""})
+                )
+                asr_buf = np.zeros((0,), dtype=np.int16)
+
+    except WebSocketDisconnect:
+        print("Client disconnected")
