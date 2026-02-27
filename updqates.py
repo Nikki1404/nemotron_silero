@@ -1,155 +1,66 @@
-import asyncio
-import json
-import time
-from dataclasses import dataclass
-from typing import Optional
+getting this 
+(nemo) PS C:\Users\re_nikitav\Documents\nemotron_silero> python .\client.py
+🎙️ Speak now... Ctrl+C to stop
+Traceback (most recent call last):
+  File "C:\Users\re_nikitav\Documents\nemotron_silero\client.py", line 72, in <module>
+    asyncio.run(run())
+    ~~~~~~~~~~~^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\Users\re_nikitav\Documents\nemotron_silero\client.py", line 42, in run
+    msg = await ws.recv()
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\re_nikitav\Documents\nemotron_silero\nemo\Lib\site-packages\websockets\asyncio\connection.py", line 324, in recv
+    raise self.protocol.close_exc from self.recv_exc
+websockets.exceptions.ConnectionClosedError: no close frame received or sent
 
-import numpy as np
-import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
-import nemo.collections.asr as nemo_asr
-
-# ===============================
-# DEBUG FLAGS
-# ===============================
-DEBUG_AUDIO = True
-DEBUG_VAD = True
-DEBUG_ASR = True
-
-# ===============================
-# CONFIG
-# ===============================
-SR = 16000
-ASR_CHUNK_MS = 160
-ASR_CHUNK_SAMPLES = int(SR * ASR_CHUNK_MS / 1000)
-
-VAD_FRAME_SAMPLES = 512
-VAD_START_TH = 0.6
-VAD_END_TH = 0.35
-MIN_SILENCE_MS = 400
-
-MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-app = FastAPI()
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "device": DEVICE}
-
-
-# ===============================
-# Load Nemotron (Built-In Streaming)
-# ===============================
-print("[INIT] Loading Nemotron...")
-asr_model = nemo_asr.models.ASRModel.from_pretrained(
-    model_name=MODEL_NAME
-).to(DEVICE).eval()
-
-print("[INIT] Nemotron ready.")
-
-
-# ===============================
-# Load Silero VAD
-# ===============================
-print("[INIT] Loading Silero VAD...")
-vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
-vad_model.to("cpu").eval()
-
-
-def silero_prob(frame):
-    audio = frame.astype(np.float32) / 32768.0
-    with torch.no_grad():
-        return float(vad_model(torch.from_numpy(audio), SR).item())
-
-
-@dataclass
-class VADState:
-    speaking: bool = False
-    silence_ms: int = 0
-
-
-# ===============================
-# WebSocket
-# ===============================
-@app.websocket("/ws")
-async def ws_asr(ws: WebSocket):
-    await ws.accept()
-
-    vad_state = VADState()
-    vad_buf = np.zeros((0,), dtype=np.int16)
-    asr_buf = np.zeros((0,), dtype=np.int16)
-
-    try:
-        while True:
-            data = await ws.receive_bytes()
-
-            if DEBUG_AUDIO:
-                print(f"[AUDIO] {len(data)} bytes")
-
-            chunk = np.frombuffer(data, dtype=np.int16)
-
-            vad_buf = np.concatenate([vad_buf, chunk])
-            asr_buf = np.concatenate([asr_buf, chunk])
-
-            end_utt = False
-
-            # ===============================
-            # VAD PROCESS
-            # ===============================
-            while len(vad_buf) >= VAD_FRAME_SAMPLES:
-                frame = vad_buf[:VAD_FRAME_SAMPLES]
-                vad_buf = vad_buf[VAD_FRAME_SAMPLES:]
-
-                p = silero_prob(frame)
-
-                if DEBUG_VAD:
-                    print(f"[VAD] prob={p:.3f}")
-
-                if not vad_state.speaking:
-                    if p >= VAD_START_TH:
-                        vad_state.speaking = True
-                        print("[VAD] SPEECH START")
-                else:
-                    if p <= VAD_END_TH:
-                        vad_state.speaking = False
-                        end_utt = True
-                        print("[VAD] SPEECH END")
-
-            # ===============================
-            # ASR PROCESS (Built-In Streaming)
-            # ===============================
-            if vad_state.speaking:
-                while len(asr_buf) >= ASR_CHUNK_SAMPLES:
-                    chunk = asr_buf[:ASR_CHUNK_SAMPLES]
-                    asr_buf = asr_buf[ASR_CHUNK_SAMPLES:]
-
-                    audio_f32 = chunk.astype(np.float32) / 32768.0
-
-                    with torch.no_grad():
-                        result = asr_model.streaming_transcribe(
-                            audio=[audio_f32],
-                            sample_rate=SR,
-                        )
-
-                    text = result[0] if result else ""
-
-                    if DEBUG_ASR:
-                        print(f"[ASR] TEXT: '{text}'")
-
-                    if text:
-                        await ws.send_text(
-                            json.dumps({"type": "partial", "text": text})
-                        )
-
-            if end_utt:
-                print("[FINAL]")
-                await ws.send_text(
-                    json.dumps({"type": "final", "text": ""})
-                )
-                asr_buf = np.zeros((0,), dtype=np.int16)
-
-    except WebSocketDisconnect:
-        print("Client disconnected")
+server logs -
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/protocols/websockets/websockets_impl.py", line 244, in run_asgi
+    result = await self.app(self.scope, self.asgi_receive, self.asgi_send)  # type: ignore[func-returns-value]
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/applications.py", line 1160, in __call__
+    await super().__call__(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/applications.py", line 107, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/errors.py", line 151, in __call__
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 364, in handle
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 145, in app
+    await wrap_app_handling_exceptions(app, session)(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 142, in app
+    await func(session)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 530, in app
+    await dependant.call(**solved_result.values)
+  File "/app/server.py", line 132, in ws_asr
+    result = asr_model.streaming_transcribe(
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1931, in __getattr__
+    raise AttributeError(
+AttributeError: 'EncDecRNNTBPEModel' object has no attribute 'streaming_transcribe'
+INFO:     connection closed
