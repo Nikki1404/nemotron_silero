@@ -1,40 +1,44 @@
-import asyncio
 import json
 import time
-import copy  # ✅ FIX: use Python deepcopy
+import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 
 import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from omegaconf import OmegaConf, open_dict
 
 import nemo.collections.asr as nemo_asr
-from nemo.collections.asr.models.ctc_bpe_models import EncDecCTCModelBPE
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 
-# -----------------------------
-# Low-latency config
-# -----------------------------
+# ===============================
+# LOGGING
+# ===============================
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)-5s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("ASR_SERVER")
+
+# ===============================
+# CONFIG
+# ===============================
 SR = 16000
 
-ASR_CHUNK_MS = 80
-ASR_CHUNK_SAMPLES = int(SR * ASR_CHUNK_MS / 1000)
+# Partial behavior (sliding window)
+PARTIAL_EVERY_S = 0.35      # how often to emit partials (increase if GPU is weak)
+PARTIAL_WINDOW_S = 6.0      # longer window helps Nemotron produce text reliably
 
-VAD_FRAME_SAMPLES = 512  # 32ms @ 16k
-
-VAD_START_TH = 0.60
-VAD_END_TH = 0.35
-MIN_SPEECH_MS = 120
-MIN_SILENCE_MS = 280
+# VAD
+VAD_FRAME_SAMPLES = 512     # 32ms @ 16k
+VAD_START_TH = 0.45         # 🔥 lowered (more sensitive)
+VAD_END_TH = 0.25           # 🔥 lowered
+MIN_SILENCE_MS = 600        # 🔥 more tolerant, avoids early cutoffs
 MAX_UTT_S = 20.0
 
-PARTIAL_THROTTLE_S = 0.06
-DROP_IF_BACKLOG_EXCEEDS_CHUNKS = 6
+# Safety: Nemotron often needs enough speech audio to output text
+MIN_UTT_AUDIO_MS_FOR_ASR = 400  # don’t call ASR if speech < 400ms (prevents empty outputs)
 
 MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 app = FastAPI()
@@ -45,234 +49,189 @@ def health():
     return {"ok": True, "device": DEVICE, "model": MODEL_NAME, "sr": SR}
 
 
-def extract_transcriptions(hyps):
-    if not hyps:
-        return [""]
-    if isinstance(hyps[0], Hypothesis):
-        return [h.text for h in hyps]
-    return hyps
-
-
-# ✅ FIXED HERE
-def init_streaming_preprocessor(asr_model):
-    cfg = copy.deepcopy(asr_model._cfg)
-    OmegaConf.set_struct(cfg.preprocessor, False)
-    cfg.preprocessor.dither = 0.0
-    cfg.preprocessor.pad_to = 0
-    cfg.preprocessor.normalize = "None"
-
-    pre = EncDecCTCModelBPE.from_config_dict(cfg.preprocessor)
-    pre.to(asr_model.device).eval()
-    return pre
-
-
-class NemotronStreamer:
-    def __init__(self, model_name: str, device: str, right_context_frames: int = 0):
-        self.device = torch.device(device)
-        self.model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name).to(self.device).eval()
-
+# ===============================
+# NeMo output -> plain string
+# ===============================
+def nemo_to_text(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if hasattr(x, "text"):
         try:
-            left = int(self.model.encoder.att_context_size[0])
-            self.model.encoder.set_default_att_context_size([left, int(right_context_frames)])
+            return x.text or ""
         except Exception:
-            pass
+            return ""
+    if isinstance(x, (list, tuple)):
+        if len(x) == 0:
+            return ""
+        return nemo_to_text(x[0])
+    return str(x)
 
-        decoding_cfg = self.model.cfg.decoding
-        with open_dict(decoding_cfg):
-            decoding_cfg.strategy = "greedy"
-            decoding_cfg.preserve_alignments = False
-            if hasattr(decoding_cfg, "fused_batch_size"):
-                decoding_cfg.fused_batch_size = -1
-        self.model.change_decoding_strategy(decoding_cfg)
 
-        self.preprocessor = init_streaming_preprocessor(self.model)
-        self.pre_encode_cache_size = int(self.model.encoder.streaming_cfg.pre_encode_cache_size[1])
-        self.num_feat = int(self.model.cfg.preprocessor.features)
+def transcribe_text(audio_f32: np.ndarray) -> str:
+    """Always returns a string, never Hypothesis."""
+    if audio_f32.size == 0:
+        return ""
+    with torch.no_grad():
+        out = asr_model.transcribe([audio_f32], batch_size=1)
+    return nemo_to_text(out).strip()
 
-        self.reset()
 
-    def reset(self):
-        self.cache_last_channel, self.cache_last_time, self.cache_last_channel_len = (
-            self.model.encoder.get_initial_cache_state(batch_size=1)
-        )
-        self.previous_hypotheses = None
-        self.pred_out_stream = None
-        self.cache_pre_encode = torch.zeros((1, self.num_feat, self.pre_encode_cache_size), device=self.device)
-        self._last_text = ""
+# ===============================
+# Load ASR
+# ===============================
+logger.info("INIT | Loading Nemotron...")
+asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME).to(DEVICE).eval()
+logger.info(f"INIT | Model class: {asr_model.__class__.__name__} | DEVICE={DEVICE}")
 
-    def stream_step_pcm16(self, pcm16: np.ndarray) -> str:
-        audio_f32 = (pcm16.astype(np.float32) / 32768.0)
-        audio_signal = torch.from_numpy(audio_f32).unsqueeze(0).to(self.device)
-        audio_len = torch.tensor([audio_f32.shape[0]], device=self.device, dtype=torch.float32)
+logger.info("INIT | Warming up...")
+dummy = np.zeros(SR, dtype=np.float32)  # 1s
+warm = transcribe_text(dummy)
+logger.info(f"INIT | Warmup done. (warmup_text='{warm}')")
 
-        processed_signal, processed_signal_length = self.preprocessor(input_signal=audio_signal, length=audio_len)
+# ===============================
+# Load Silero VAD (CPU)
+# ===============================
+logger.info("INIT | Loading Silero VAD...")
+vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
+vad_model.to("cpu").eval()
+logger.info("INIT | Silero ready.")
 
-        processed_signal = torch.cat([self.cache_pre_encode, processed_signal], dim=-1)
-        processed_signal_length = processed_signal_length + self.cache_pre_encode.shape[2]
-        self.cache_pre_encode = processed_signal[:, :, -self.pre_encode_cache_size:]
 
-        with torch.no_grad():
-            (
-                self.pred_out_stream,
-                transcribed_texts,
-                self.cache_last_channel,
-                self.cache_last_time,
-                self.cache_last_channel_len,
-                self.previous_hypotheses,
-            ) = self.model.conformer_stream_step(
-                processed_signal=processed_signal,
-                processed_signal_length=processed_signal_length,
-                cache_last_channel=self.cache_last_channel,
-                cache_last_time=self.cache_last_time,
-                cache_last_channel_len=self.cache_last_channel_len,
-                keep_all_outputs=False,
-                previous_hypotheses=self.previous_hypotheses,
-                previous_pred_out=self.pred_out_stream,
-                drop_extra_pre_encoded=None,
-                return_transcription=True,
-            )
-
-        text = extract_transcriptions(transcribed_texts)[0] if transcribed_texts is not None else ""
-        self._last_text = text
-        return text
-
-    @property
-    def last_text(self) -> str:
-        return self._last_text
+def silero_prob_32ms(frame_pcm16: np.ndarray) -> float:
+    audio = frame_pcm16.astype(np.float32) / 32768.0
+    with torch.no_grad():
+        return float(vad_model(torch.from_numpy(audio), SR).item())
 
 
 @dataclass
 class VADState:
     speaking: bool = False
-    speech_ms: int = 0
     silence_ms: int = 0
     utt_start_t: Optional[float] = None
 
-    def reset(self):
-        self.speaking = False
-        self.speech_ms = 0
-        self.silence_ms = 0
-        self.utt_start_t = None
 
-
-def pcm16_to_float32(x: np.ndarray) -> np.ndarray:
-    return x.astype(np.float32) / 32768.0
-
-
-print(f"[server] DEVICE={DEVICE}")
-print("[server] Loading Nemotron...")
-asr = NemotronStreamer(MODEL_NAME, DEVICE, right_context_frames=0)
-
-print("[server] Loading Silero VAD...")
-vad_model, _ = torch.hub.load(
-    repo_or_dir="snakers4/silero-vad",
-    model="silero_vad",
-    trust_repo=True,
-)
-
-# ✅ Keep VAD on CPU for stability + lower latency
-vad_device = torch.device("cpu")
-vad_model.to(vad_device).eval()
-
-
-def silero_prob_32ms(frame_pcm16: np.ndarray) -> float:
-    x = pcm16_to_float32(frame_pcm16)
-    xt = torch.from_numpy(x).to(vad_device)
-    with torch.no_grad():
-        return float(vad_model(xt, SR).item())
+def pcm16_rms_db(pcm16: np.ndarray) -> float:
+    if pcm16.size == 0:
+        return -120.0
+    x = pcm16.astype(np.float32) / 32768.0
+    rms = float(np.sqrt(np.mean(x * x) + 1e-12))
+    db = 20.0 * np.log10(rms + 1e-12)
+    return db
 
 
 @app.websocket("/ws")
 async def ws_asr(ws: WebSocket):
     await ws.accept()
+    logger.info("WS | Client connected")
 
     vad_state = VADState()
     vad_buf = np.zeros((0,), dtype=np.int16)
-    asr_buf = np.zeros((0,), dtype=np.int16)
+    speech_buf = np.zeros((0,), dtype=np.int16)
 
-    incoming_chunks = 0
-    last_sent = ""
+    last_partial_text = ""
     last_partial_ts = 0.0
+    last_audio_log_ts = 0.0
 
     try:
         while True:
             data = await ws.receive_bytes()
-            incoming_chunks += 1
-
-            if incoming_chunks > DROP_IF_BACKLOG_EXCEEDS_CHUNKS:
-                incoming_chunks = 0
-                vad_buf = np.zeros((0,), dtype=np.int16)
-                asr_buf = np.zeros((0,), dtype=np.int16)
-                await ws.send_text(json.dumps({"type": "warn", "message": "Dropped audio to reduce latency"}))
-                continue
 
             chunk = np.frombuffer(data, dtype=np.int16)
             vad_buf = np.concatenate([vad_buf, chunk])
-            asr_buf = np.concatenate([asr_buf, chunk])
+
+            # periodic audio-level log (confirms mic is not silent)
+            now = time.time()
+            if now - last_audio_log_ts >= 1.0:
+                last_audio_log_ts = now
+                logger.debug(f"AUDIO | recv_bytes={len(data)} rms_db={pcm16_rms_db(chunk):.1f}dB")
+
+            # only collect speech after VAD start
+            if vad_state.speaking:
+                speech_buf = np.concatenate([speech_buf, chunk])
 
             end_utt = False
+
+            # ---- VAD ----
             while len(vad_buf) >= VAD_FRAME_SAMPLES:
                 frame = vad_buf[:VAD_FRAME_SAMPLES]
                 vad_buf = vad_buf[VAD_FRAME_SAMPLES:]
 
                 p = silero_prob_32ms(frame)
                 frame_ms = int(1000 * (VAD_FRAME_SAMPLES / SR))
-                now = time.time()
+                tnow = time.time()
+
+                # log VAD prob occasionally
+                logger.debug(f"VAD | p={p:.3f} speaking={vad_state.speaking}")
 
                 if not vad_state.speaking:
                     if p >= VAD_START_TH:
-                        vad_state.speech_ms += frame_ms
-                        if vad_state.speech_ms >= MIN_SPEECH_MS:
-                            vad_state.speaking = True
-                            vad_state.utt_start_t = now
-                            vad_state.silence_ms = 0
-                    else:
-                        vad_state.speech_ms = 0
+                        vad_state.speaking = True
+                        vad_state.silence_ms = 0
+                        vad_state.utt_start_t = tnow
+                        speech_buf = np.zeros((0,), dtype=np.int16)
+                        last_partial_text = ""
+                        last_partial_ts = 0.0
+                        logger.info("VAD | SPEECH_START")
                 else:
                     if p <= VAD_END_TH:
                         vad_state.silence_ms += frame_ms
                         if vad_state.silence_ms >= MIN_SILENCE_MS:
                             vad_state.speaking = False
-                            vad_state.speech_ms = 0
                             end_utt = True
+                            logger.info("VAD | SPEECH_END")
                     else:
                         vad_state.silence_ms = 0
 
-                    if vad_state.utt_start_t and (now - vad_state.utt_start_t) >= MAX_UTT_S:
+                    if vad_state.utt_start_t and (tnow - vad_state.utt_start_t) >= MAX_UTT_S:
                         vad_state.speaking = False
                         end_utt = True
+                        logger.info("VAD | MAX_UTT_END")
 
-            if vad_state.speaking:
-                while len(asr_buf) >= ASR_CHUNK_SAMPLES:
-                    asr_chunk = asr_buf[:ASR_CHUNK_SAMPLES]
-                    asr_buf = asr_buf[ASR_CHUNK_SAMPLES:]
+            # ---- PARTIAL ----
+            if vad_state.speaking and speech_buf.size > 0 and (time.time() - last_partial_ts) >= PARTIAL_EVERY_S:
+                last_partial_ts = time.time()
 
-                    text = asr.stream_step_pcm16(asr_chunk)
-                    tnow = time.time()
-                    if text and text != last_sent and (tnow - last_partial_ts) >= PARTIAL_THROTTLE_S:
+                # don’t ASR too early (prevents empty output)
+                utt_ms = int(1000 * (speech_buf.size / SR))
+                if utt_ms < MIN_UTT_AUDIO_MS_FOR_ASR:
+                    logger.debug(f"ASR | PARTIAL skip (utt_ms={utt_ms} < {MIN_UTT_AUDIO_MS_FOR_ASR})")
+                else:
+                    max_samples = int(PARTIAL_WINDOW_S * SR)
+                    use_pcm = speech_buf[-max_samples:] if speech_buf.size > max_samples else speech_buf
+                    audio_f32 = use_pcm.astype(np.float32) / 32768.0
+
+                    text = transcribe_text(audio_f32)
+                    logger.debug(f"ASR | PARTIAL window_ms={int(1000*use_pcm.size/SR)} text='{text}'")
+
+                    if text and text != last_partial_text:
+                        last_partial_text = text
                         await ws.send_text(json.dumps({"type": "partial", "text": text}))
-                        last_sent = text
-                        last_partial_ts = tnow
-            else:
-                if len(asr_buf) > ASR_CHUNK_SAMPLES:
-                    asr_buf = asr_buf[-ASR_CHUNK_SAMPLES:]
 
+            # ---- FINAL ----
             if end_utt:
-                final_text = (asr.last_text or "").strip()
+                utt_ms = int(1000 * (speech_buf.size / SR))
+                if utt_ms < MIN_UTT_AUDIO_MS_FOR_ASR:
+                    final_text = ""
+                    logger.info(f"ASR | FINAL skipped (utt_ms={utt_ms} too short)")
+                else:
+                    audio_f32 = speech_buf.astype(np.float32) / 32768.0
+                    final_text = transcribe_text(audio_f32)
+                    logger.info(f"ASR | FINAL utt_ms={utt_ms} text='{final_text}'")
+
                 await ws.send_text(json.dumps({"type": "final", "text": final_text}))
 
-                asr.reset()
-                vad_state.reset()
-                last_sent = ""
+                # reset
+                speech_buf = np.zeros((0,), dtype=np.int16)
+                vad_state = VADState()
+                last_partial_text = ""
                 last_partial_ts = 0.0
-                vad_buf = np.zeros((0,), dtype=np.int16)
-                asr_buf = np.zeros((0,), dtype=np.int16)
-
-            incoming_chunks = max(0, incoming_chunks - 1)
 
     except WebSocketDisconnect:
-        return
+        logger.info("WS | Client disconnected")
     except Exception as e:
+        logger.exception(f"WS | ERROR: {e}")
         try:
             await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
         except Exception:
