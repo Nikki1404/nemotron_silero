@@ -9,35 +9,27 @@ import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 import nemo.collections.asr as nemo_asr
-
-# ===============================
-# LOGGING
-# ===============================
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s | %(levelname)-5s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("ASR_SERVER")
 
-# ===============================
-# CONFIG
-# ===============================
 SR = 16000
 
 # Partial behavior (sliding window)
-PARTIAL_EVERY_S = 0.35      # how often to emit partials (increase if GPU is weak)
-PARTIAL_WINDOW_S = 6.0      # longer window helps Nemotron produce text reliably
+PARTIAL_EVERY_S = 0.35     
+PARTIAL_WINDOW_S = 6.0  
 
 # VAD
 VAD_FRAME_SAMPLES = 512     # 32ms @ 16k
-VAD_START_TH = 0.45         # 🔥 lowered (more sensitive)
-VAD_END_TH = 0.25           # 🔥 lowered
-MIN_SILENCE_MS = 600        # 🔥 more tolerant, avoids early cutoffs
+VAD_START_TH = 0.45         #  lowered (more sensitive)
+VAD_END_TH = 0.25           #  lowered
+MIN_SILENCE_MS = 600        #  more tolerant, avoids early cutoffs
 MAX_UTT_S = 20.0
 
 # Safety: Nemotron often needs enough speech audio to output text
-MIN_UTT_AUDIO_MS_FOR_ASR = 400  # don’t call ASR if speech < 400ms (prevents empty outputs)
-
+MIN_UTT_AUDIO_MS_FOR_ASR = 400  
 MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -48,10 +40,7 @@ app = FastAPI()
 def health():
     return {"ok": True, "device": DEVICE, "model": MODEL_NAME, "sr": SR}
 
-
-# ===============================
 # NeMo output -> plain string
-# ===============================
 def nemo_to_text(x: Any) -> str:
     if x is None:
         return ""
@@ -77,10 +66,7 @@ def transcribe_text(audio_f32: np.ndarray) -> str:
         out = asr_model.transcribe([audio_f32], batch_size=1)
     return nemo_to_text(out).strip()
 
-
-# ===============================
 # Load ASR
-# ===============================
 logger.info("INIT | Loading Nemotron...")
 asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME).to(DEVICE).eval()
 logger.info(f"INIT | Model class: {asr_model.__class__.__name__} | DEVICE={DEVICE}")
@@ -90,9 +76,7 @@ dummy = np.zeros(SR, dtype=np.float32)  # 1s
 warm = transcribe_text(dummy)
 logger.info(f"INIT | Warmup done. (warmup_text='{warm}')")
 
-# ===============================
 # Load Silero VAD (CPU)
-# ===============================
 logger.info("INIT | Loading Silero VAD...")
 vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
 vad_model.to("cpu").eval()
