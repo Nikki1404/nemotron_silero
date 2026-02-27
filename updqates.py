@@ -1,246 +1,59 @@
-import asyncio
-import json
-import time
-import copy
-from dataclasses import dataclass
-from typing import Optional
+      pruning_mode: LATE
+      allow_cuda_graphs: true
+      tsd_max_sym_exp: 50
+    temperature: 1.0
+    durations: []
+    big_blank_durations: []
 
-import numpy as np
-import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from omegaconf import OmegaConf, open_dict
-
-import nemo.collections.asr as nemo_asr
-from nemo.collections.asr.models.ctc_bpe_models import EncDecCTCModelBPE
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-
-# ===============================
-# DEBUG FLAGS
-# ===============================
-DEBUG_AUDIO = True
-DEBUG_VAD = True
-DEBUG_ASR = True
-
-# ===============================
-# CONFIG
-# ===============================
-SR = 16000
-
-ASR_CHUNK_MS = 160   # 🔥 increased for stability
-ASR_CHUNK_SAMPLES = int(SR * ASR_CHUNK_MS / 1000)
-
-VAD_FRAME_SAMPLES = 512  # 32ms
-
-VAD_START_TH = 0.60
-VAD_END_TH = 0.35
-MIN_SPEECH_MS = 120
-MIN_SILENCE_MS = 400   # 🔥 slightly higher to avoid early cut
-MAX_UTT_S = 20.0
-
-MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-app = FastAPI()
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "device": DEVICE}
-
-
-# ===============================
-# Helpers
-# ===============================
-
-def extract_transcriptions(hyps):
-    if not hyps:
-        return [""]
-    if isinstance(hyps[0], Hypothesis):
-        return [h.text for h in hyps]
-    return hyps
-
-
-def init_streaming_preprocessor(asr_model):
-    cfg = copy.deepcopy(asr_model._cfg)
-    OmegaConf.set_struct(cfg.preprocessor, False)
-    cfg.preprocessor.dither = 0.0
-    cfg.preprocessor.pad_to = 0
-    cfg.preprocessor.normalize = "None"
-
-    pre = EncDecCTCModelBPE.from_config_dict(cfg.preprocessor)
-    pre.to(asr_model.device).eval()
-    return pre
-
-
-# ===============================
-# Nemotron Streamer
-# ===============================
-
-class NemotronStreamer:
-    def __init__(self):
-        print("[INIT] Loading Nemotron...")
-        self.model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME).to(DEVICE).eval()
-
-        decoding_cfg = self.model.cfg.decoding
-        with open_dict(decoding_cfg):
-            decoding_cfg.strategy = "greedy"
-        self.model.change_decoding_strategy(decoding_cfg)
-
-        self.preprocessor = init_streaming_preprocessor(self.model)
-        self.pre_encode_cache_size = int(self.model.encoder.streaming_cfg.pre_encode_cache_size[1])
-        self.num_feat = int(self.model.cfg.preprocessor.features)
-
-        self.reset()
-
-        # 🔥 Warmup
-        print("[INIT] Warming up model...")
-        dummy = np.zeros(ASR_CHUNK_SAMPLES, dtype=np.int16)
-        self.stream_step(dummy)
-        self.reset()
-        print("[INIT] Warmup complete.")
-
-    def reset(self):
-        self.cache_last_channel, self.cache_last_time, self.cache_last_channel_len = (
-            self.model.encoder.get_initial_cache_state(batch_size=1)
-        )
-        self.previous_hypotheses = None
-        self.pred_out_stream = None
-        self.cache_pre_encode = torch.zeros((1, self.num_feat, self.pre_encode_cache_size), device=DEVICE)
-        self._last_text = ""
-
-    def stream_step(self, pcm16: np.ndarray):
-        audio_f32 = pcm16.astype(np.float32) / 32768.0
-        audio_signal = torch.from_numpy(audio_f32).unsqueeze(0).to(DEVICE)
-        audio_len = torch.tensor([audio_f32.shape[0]], device=DEVICE)
-
-        processed_signal, processed_signal_length = self.preprocessor(audio_signal, audio_len)
-
-        processed_signal = torch.cat([self.cache_pre_encode, processed_signal], dim=-1)
-        processed_signal_length += self.cache_pre_encode.shape[2]
-        self.cache_pre_encode = processed_signal[:, :, -self.pre_encode_cache_size:]
-
-        with torch.no_grad():
-            (
-                self.pred_out_stream,
-                transcribed_texts,
-                self.cache_last_channel,
-                self.cache_last_time,
-                self.cache_last_channel_len,
-                self.previous_hypotheses,
-            ) = self.model.conformer_stream_step(
-                processed_signal=processed_signal,
-                processed_signal_length=processed_signal_length,
-                cache_last_channel=self.cache_last_channel,
-                cache_last_time=self.cache_last_time,
-                cache_last_channel_len=self.cache_last_channel_len,
-                previous_hypotheses=self.previous_hypotheses,
-                previous_pred_out=self.pred_out_stream,
-                return_transcription=True,
-            )
-
-        text = extract_transcriptions(transcribed_texts)[0]
-        self._last_text = text
-
-        if DEBUG_ASR:
-            print(f"[ASR] TEXT: '{text}'")
-
-        return text
-
-    @property
-    def last_text(self):
-        return self._last_text
-
-
-# ===============================
-# Silero VAD
-# ===============================
-
-print("[INIT] Loading Silero VAD...")
-vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
-vad_model.to("cpu").eval()
-
-
-def silero_prob(frame):
-    audio = frame.astype(np.float32) / 32768.0
-    with torch.no_grad():
-        return float(vad_model(torch.from_numpy(audio), SR).item())
-
-
-@dataclass
-class VADState:
-    speaking: bool = False
-    speech_ms: int = 0
-    silence_ms: int = 0
-
-
-# ===============================
-# Load models
-# ===============================
-
-asr = NemotronStreamer()
-
-
-# ===============================
-# WebSocket
-# ===============================
-
-@app.websocket("/ws")
-async def ws_asr(ws: WebSocket):
-    await ws.accept()
-
-    vad_state = VADState()
-    vad_buf = np.zeros((0,), dtype=np.int16)
-    asr_buf = np.zeros((0,), dtype=np.int16)
-
-    try:
-        while True:
-            data = await ws.receive_bytes()
-
-            if DEBUG_AUDIO:
-                print(f"[AUDIO] Received {len(data)} bytes")
-
-            chunk = np.frombuffer(data, dtype=np.int16)
-            vad_buf = np.concatenate([vad_buf, chunk])
-            asr_buf = np.concatenate([asr_buf, chunk])
-
-            # ---- VAD ----
-            end_utt = False
-
-            while len(vad_buf) >= VAD_FRAME_SAMPLES:
-                frame = vad_buf[:VAD_FRAME_SAMPLES]
-                vad_buf = vad_buf[VAD_FRAME_SAMPLES:]
-
-                p = silero_prob(frame)
-
-                if DEBUG_VAD:
-                    print(f"[VAD] prob={p:.3f}")
-
-                if not vad_state.speaking:
-                    if p > VAD_START_TH:
-                        vad_state.speaking = True
-                        print("[VAD] SPEECH START")
-                else:
-                    if p < VAD_END_TH:
-                        vad_state.speaking = False
-                        end_utt = True
-                        print("[VAD] SPEECH END")
-
-            # ---- ASR ----
-            if vad_state.speaking:
-                while len(asr_buf) >= ASR_CHUNK_SAMPLES:
-                    chunk = asr_buf[:ASR_CHUNK_SAMPLES]
-                    asr_buf = asr_buf[ASR_CHUNK_SAMPLES:]
-
-                    text = asr.stream_step(chunk)
-
-                    if text:
-                        await ws.send_text(json.dumps({"type": "partial", "text": text}))
-
-            if end_utt:
-                final_text = asr.last_text
-                print(f"[FINAL] '{final_text}'")
-                await ws.send_text(json.dumps({"type": "final", "text": final_text}))
-                asr.reset()
-
-    except WebSocketDisconnect:
-        print("Client disconnected")
+[INIT] Warming up model...
+Traceback (most recent call last):
+  File "/usr/local/bin/uvicorn", line 6, in <module>
+    sys.exit(main())
+  File "/usr/local/lib/python3.10/dist-packages/click/core.py", line 1485, in __call__
+    return self.main(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/click/core.py", line 1406, in main
+    rv = self.invoke(ctx)
+  File "/usr/local/lib/python3.10/dist-packages/click/core.py", line 1269, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+  File "/usr/local/lib/python3.10/dist-packages/click/core.py", line 824, in invoke
+    return callback(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/main.py", line 433, in main
+    run(
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/main.py", line 606, in run
+    server.run()
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/server.py", line 75, in run
+    return asyncio_run(self.serve(sockets=sockets), loop_factory=self.config.get_loop_factory())
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/_compat.py", line 60, in asyncio_run
+    return loop.run_until_complete(main)
+  File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/server.py", line 79, in serve
+    await self._serve(sockets)
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/server.py", line 86, in _serve
+    config.load()
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/config.py", line 441, in load
+    self.loaded_app = import_from_string(self.app)
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/importer.py", line 19, in import_from_string
+    module = importlib.import_module(module_str)
+  File "/usr/lib/python3.10/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+  File "<frozen importlib._bootstrap>", line 1050, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 883, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "/app/server.py", line 180, in <module>
+    asr = NemotronStreamer()
+  File "/app/server.py", line 98, in __init__
+    self.stream_step(dummy)
+  File "/app/server.py", line 116, in stream_step
+    processed_signal, processed_signal_length = self.preprocessor(audio_signal, audio_len)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/nemo/core/classes/common.py", line 1192, in wrapped_call
+    raise TypeError("All arguments must be passed by kwargs only for typed methods")
+TypeError: All arguments must be passed by kwargs only for typed methods
+(base) root@EC03-E01-AICOE1:/home/CORP/re_nikitav/nemotron_silero#
+                                                      getting this while docker run now 
