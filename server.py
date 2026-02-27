@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import copy  # ✅ FIX: use Python deepcopy
 from dataclasses import dataclass
 from typing import Optional
 
@@ -29,8 +30,8 @@ MIN_SPEECH_MS = 120
 MIN_SILENCE_MS = 280
 MAX_UTT_S = 20.0
 
-PARTIAL_THROTTLE_S = 0.06  # send partial at most every 60ms
-DROP_IF_BACKLOG_EXCEEDS_CHUNKS = 6  # drop old audio if backlog grows (avoid latency buildup)
+PARTIAL_THROTTLE_S = 0.06
+DROP_IF_BACKLOG_EXCEEDS_CHUNKS = 6
 
 MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
 
@@ -52,9 +53,9 @@ def extract_transcriptions(hyps):
     return hyps
 
 
+# ✅ FIXED HERE
 def init_streaming_preprocessor(asr_model):
-    # Streaming-friendly preprocessor settings
-    cfg = torch.nn.modules.module.deepcopy(asr_model._cfg)
+    cfg = copy.deepcopy(asr_model._cfg)
     OmegaConf.set_struct(cfg.preprocessor, False)
     cfg.preprocessor.dither = 0.0
     cfg.preprocessor.pad_to = 0
@@ -70,14 +71,12 @@ class NemotronStreamer:
         self.device = torch.device(device)
         self.model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name).to(self.device).eval()
 
-        # Lowest-latency attention right context (Nemotron supports 0/1/6/13 typically)
         try:
             left = int(self.model.encoder.att_context_size[0])
             self.model.encoder.set_default_att_context_size([left, int(right_context_frames)])
         except Exception:
             pass
 
-        # Greedy decoding for speed
         decoding_cfg = self.model.cfg.decoding
         with open_dict(decoding_cfg):
             decoding_cfg.strategy = "greedy"
@@ -86,7 +85,6 @@ class NemotronStreamer:
                 decoding_cfg.fused_batch_size = -1
         self.model.change_decoding_strategy(decoding_cfg)
 
-        # Streaming preprocessor + pre-encode cache
         self.preprocessor = init_streaming_preprocessor(self.model)
         self.pre_encode_cache_size = int(self.model.encoder.streaming_cfg.pre_encode_cache_size[1])
         self.num_feat = int(self.model.cfg.preprocessor.features)
@@ -103,15 +101,12 @@ class NemotronStreamer:
         self._last_text = ""
 
     def stream_step_pcm16(self, pcm16: np.ndarray) -> str:
-        # PCM16 -> float32 [-1,1]
         audio_f32 = (pcm16.astype(np.float32) / 32768.0)
         audio_signal = torch.from_numpy(audio_f32).unsqueeze(0).to(self.device)
         audio_len = torch.tensor([audio_f32.shape[0]], device=self.device, dtype=torch.float32)
 
-        # Preprocess to features
         processed_signal, processed_signal_length = self.preprocessor(input_signal=audio_signal, length=audio_len)
 
-        # Prepend pre-encode cache
         processed_signal = torch.cat([self.cache_pre_encode, processed_signal], dim=-1)
         processed_signal_length = processed_signal_length + self.cache_pre_encode.shape[2]
         self.cache_pre_encode = processed_signal[:, :, -self.pre_encode_cache_size:]
@@ -164,28 +159,23 @@ def pcm16_to_float32(x: np.ndarray) -> np.ndarray:
     return x.astype(np.float32) / 32768.0
 
 
-# -----------------------------
-# Load models (once)
-# -----------------------------
 print(f"[server] DEVICE={DEVICE}")
 print("[server] Loading Nemotron...")
 asr = NemotronStreamer(MODEL_NAME, DEVICE, right_context_frames=0)
 
 print("[server] Loading Silero VAD...")
-# Avoid runtime internet dependency by vendoring the repo in Docker build (see Dockerfile).
-# This torch.hub.load will then use local cached repo under /root/.cache/torch/hub.
 vad_model, _ = torch.hub.load(
     repo_or_dir="snakers4/silero-vad",
     model="silero_vad",
     trust_repo=True,
 )
 
-vad_device = torch.device(DEVICE if DEVICE.startswith("cuda") else "cpu")
+# ✅ Keep VAD on CPU for stability + lower latency
+vad_device = torch.device("cpu")
 vad_model.to(vad_device).eval()
 
 
 def silero_prob_32ms(frame_pcm16: np.ndarray) -> float:
-    # Silero expects float tensor audio, 16k
     x = pcm16_to_float32(frame_pcm16)
     xt = torch.from_numpy(x).to(vad_device)
     with torch.no_grad():
@@ -198,13 +188,9 @@ async def ws_asr(ws: WebSocket):
 
     vad_state = VADState()
     vad_buf = np.zeros((0,), dtype=np.int16)
-
-    # Rebuffer for ASR to fixed 80ms chunks
     asr_buf = np.zeros((0,), dtype=np.int16)
 
-    # Client may send variable sizes; we keep an internal “incoming queue”
     incoming_chunks = 0
-
     last_sent = ""
     last_partial_ts = 0.0
 
@@ -213,22 +199,17 @@ async def ws_asr(ws: WebSocket):
             data = await ws.receive_bytes()
             incoming_chunks += 1
 
-            # Drop backlog if client/server gets behind (keeps latency low)
             if incoming_chunks > DROP_IF_BACKLOG_EXCEEDS_CHUNKS:
-                # best-effort: flush buffers
                 incoming_chunks = 0
                 vad_buf = np.zeros((0,), dtype=np.int16)
                 asr_buf = np.zeros((0,), dtype=np.int16)
-                # do not reset ASR mid-utterance; just discard audio to catch up
                 await ws.send_text(json.dumps({"type": "warn", "message": "Dropped audio to reduce latency"}))
                 continue
 
             chunk = np.frombuffer(data, dtype=np.int16)
-            # Update buffers
             vad_buf = np.concatenate([vad_buf, chunk])
             asr_buf = np.concatenate([asr_buf, chunk])
 
-            # ---- VAD step in 32ms frames ----
             end_utt = False
             while len(vad_buf) >= VAD_FRAME_SAMPLES:
                 frame = vad_buf[:VAD_FRAME_SAMPLES]
@@ -261,7 +242,6 @@ async def ws_asr(ws: WebSocket):
                         vad_state.speaking = False
                         end_utt = True
 
-            # ---- ASR step in 80ms chunks while speaking ----
             if vad_state.speaking:
                 while len(asr_buf) >= ASR_CHUNK_SAMPLES:
                     asr_chunk = asr_buf[:ASR_CHUNK_SAMPLES]
@@ -274,22 +254,17 @@ async def ws_asr(ws: WebSocket):
                         last_sent = text
                         last_partial_ts = tnow
             else:
-                # Not speaking: keep asr_buf from growing (drop silence)
                 if len(asr_buf) > ASR_CHUNK_SAMPLES:
                     asr_buf = asr_buf[-ASR_CHUNK_SAMPLES:]
 
-            # ---- End-of-utterance finalize ----
             if end_utt:
                 final_text = (asr.last_text or "").strip()
                 await ws.send_text(json.dumps({"type": "final", "text": final_text}))
 
-                # Reset for next utterance
                 asr.reset()
                 vad_state.reset()
                 last_sent = ""
                 last_partial_ts = 0.0
-
-                # Clear buffers so next utterance starts clean
                 vad_buf = np.zeros((0,), dtype=np.int16)
                 asr_buf = np.zeros((0,), dtype=np.int16)
 
