@@ -1,25 +1,7 @@
-Nemotron + Custom VAD vs Nemotron + Silero — Summary
+Custom VAD achieves significantly better accuracy (WER ≈ 0.11) compared to Silero (WER ≈ 0.33), a ~66% relative improvement. The gain remains ~3× better even after normalization, confirming it is not formatting-related.
 
-Accuracy
-Custom VAD mean WER ≈ 0.11
-Silero mean WER ≈ 0.33
-Approximately 66% relative improvement with Custom VAD
+Latency is similar for both systems (~9.8 seconds), with no meaningful difference.
 
-Normalized Accuracy
-Custom VAD remains ~3× better after normalization
-Improvement is not due to punctuation or formatting differences
+Custom VAD also shows better stability (10/15 files improved), while Silero had multiple high-error cases (WER = 1.0), likely due to earlier speech segmentation affecting RNNT context.
 
-Latency
-Both systems average around 9.8 seconds
-No meaningful latency difference observed
-
-Stability
-Custom VAD performed better in 10 out of 15 files
-Silero showed multiple high-error cases (WER = 1.0)
-
-Technical Observation
-Silero tends to segment speech earlier, which can negatively affect RNNT decoding context
-Custom VAD maintains longer, cleaner utterance segments, leading to more consistent transcription quality
-
-Next Steps
-Further tuning and segmentation control on top of Silero VAD may reduce the current accuracy gap. I can investigate whether threshold calibration, buffering adjustments, and segmentation refinements bring its performance closer to the custom VAD approach.
+Further tuning of Silero VAD (thresholds and buffering) may help reduce the accuracy gap.
