@@ -6,6 +6,7 @@ from typing import Optional, Any
 
 import numpy as np
 import torch
+import resampy
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 import nemo.collections.asr as nemo_asr
@@ -78,6 +79,28 @@ def transcribe_text(audio_f32: np.ndarray) -> str:
     return nemo_to_text(out).strip()
 
 
+def pcm16_rms_db(pcm16: np.ndarray) -> float:
+    if pcm16.size == 0:
+        return -120.0
+    x = pcm16.astype(np.float32) / 32768.0
+    rms = float(np.sqrt(np.mean(x * x) + 1e-12))
+    db = 20.0 * np.log10(rms + 1e-12)
+    return db
+
+
+def upsample_if_needed(pcm: bytes, client_sample_rate: int) -> bytes:
+    """
+    Resample client audio to server SR (16k) if needed.
+    """
+    if not pcm or client_sample_rate == SR:
+        return pcm
+
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    y = resampy.resample(x, client_sample_rate, SR)
+    y = np.clip(y, -1.0, 1.0)
+    return (y * 32767.0).astype(np.int16).tobytes()
+
+
 # ===============================
 # Load ASR
 # ===============================
@@ -112,15 +135,6 @@ class VADState:
     utt_start_t: Optional[float] = None
 
 
-def pcm16_rms_db(pcm16: np.ndarray) -> float:
-    if pcm16.size == 0:
-        return -120.0
-    x = pcm16.astype(np.float32) / 32768.0
-    rms = float(np.sqrt(np.mean(x * x) + 1e-12))
-    db = 20.0 * np.log10(rms + 1e-12)
-    return db
-
-
 @app.websocket("/ws")
 async def ws_asr(ws: WebSocket):
     await ws.accept()
@@ -134,9 +148,30 @@ async def ws_asr(ws: WebSocket):
     last_partial_ts = 0.0
     last_audio_log_ts = 0.0
 
+    # default client rate unless client sends config
+    client_sample_rate = SR
+
     try:
         while True:
-            data = await ws.receive_bytes()
+            msg = await ws.receive()
+
+            if "bytes" in msg and msg["bytes"] is not None:
+                data = msg["bytes"]
+            elif "text" in msg and msg["text"] is not None:
+                # Allow a config message from client: {"type":"config","sample_rate":48000}
+                try:
+                    meta = json.loads(msg["text"])
+                    if isinstance(meta, dict) and meta.get("type") == "config":
+                        client_sample_rate = int(meta.get("sample_rate", SR))
+                        logger.info(f"WS | Client sample_rate set to {client_sample_rate}")
+                    continue
+                except Exception:
+                    continue
+            else:
+                continue
+
+            # upsample if needed
+            data = upsample_if_needed(data, client_sample_rate)
 
             chunk = np.frombuffer(data, dtype=np.int16)
             vad_buf = np.concatenate([vad_buf, chunk])
@@ -145,7 +180,7 @@ async def ws_asr(ws: WebSocket):
             now = time.time()
             if now - last_audio_log_ts >= 1.0:
                 last_audio_log_ts = now
-                logger.debug(f"AUDIO | recv_bytes={len(data)} rms_db={pcm16_rms_db(chunk):.1f}dB")
+                logger.debug(f"AUDIO | recv_bytes={len(data)} rms_db={pcm16_rms_db(chunk):.1f}dB (client_sr={client_sample_rate})")
 
             # only collect speech after VAD start
             if vad_state.speaking:
@@ -162,7 +197,6 @@ async def ws_asr(ws: WebSocket):
                 frame_ms = int(1000 * (VAD_FRAME_SAMPLES / SR))
                 tnow = time.time()
 
-                # log VAD prob occasionally
                 logger.debug(f"VAD | p={p:.3f} speaking={vad_state.speaking}")
 
                 if not vad_state.speaking:
@@ -193,7 +227,6 @@ async def ws_asr(ws: WebSocket):
             if vad_state.speaking and speech_buf.size > 0 and (time.time() - last_partial_ts) >= PARTIAL_EVERY_S:
                 last_partial_ts = time.time()
 
-                # don’t ASR too early (prevents empty output)
                 utt_ms = int(1000 * (speech_buf.size / SR))
                 if utt_ms < MIN_UTT_AUDIO_MS_FOR_ASR:
                     logger.debug(f"ASR | PARTIAL skip (utt_ms={utt_ms} < {MIN_UTT_AUDIO_MS_FOR_ASR})")
