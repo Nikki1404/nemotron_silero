@@ -208,8 +208,6 @@ async def process_folder(folder_prefix: str):
 # WRITE XLSX
 def write_to_file(results):
     df = pd.DataFrame(results)
-
-    # Ensure exact column order
     df = df[[
         "filename",
         "silero-latency",
