@@ -12,10 +12,7 @@ import pandas as pd
 from tqdm import tqdm
 from whisper_normalizer.english import EnglishTextNormalizer
 
-
-# =========================
 # SERVER ENDPOINTS
-# =========================
 URL_SILERO = "ws://127.0.0.1:8000/ws"
 URL_CUSTOM_VAD = "ws://127.0.0.1:8002/asr/realtime-custom-vad"
 
@@ -30,9 +27,7 @@ s3 = boto3.client("s3")
 whisper_norm = EnglishTextNormalizer()
 
 
-# =========================
 # TEXT NORMALIZATION
-# =========================
 def normalize(txt):
     return whisper_norm(txt or "")
 
@@ -55,9 +50,7 @@ def calculate_wer(reference_str: str, hypothesis_str: str) -> float:
     )
 
 
-# =========================
 # S3 HELPERS
-# =========================
 def list_s3_subfolders():
     paginator = s3.get_paginator("list_objects_v2")
     result = paginator.paginate(
@@ -91,9 +84,7 @@ def silence_bytes(sec: float) -> bytes:
     return b"\x00\x00" * int(TARGET_SR * sec)
 
 
-# =========================
 # SILERO SERVER
-# =========================
 async def transcribe_ws_silero(wav_bytes: bytes) -> Tuple[str, int]:
     async with websockets.connect(URL_SILERO, max_size=None) as ws:
 
@@ -128,9 +119,7 @@ async def transcribe_ws_silero(wav_bytes: bytes) -> Tuple[str, int]:
         return " ".join(finals), latency_ms
 
 
-# =========================
 # CUSTOM VAD SERVER
-# =========================
 async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
     async with websockets.connect(URL_CUSTOM_VAD, max_size=None) as ws:
 
@@ -166,9 +155,7 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
         return " ".join(finals), latency_ms
 
 
-# =========================
 # PROCESS ONE AUDIO FOLDER
-# =========================
 async def process_folder(folder_prefix: str):
     objects = s3.list_objects_v2(Bucket=BUCKET, Prefix=folder_prefix)["Contents"]
 
@@ -218,9 +205,7 @@ async def process_folder(folder_prefix: str):
     }
 
 
-# =========================
 # WRITE XLSX
-# =========================
 def write_to_file(results):
     df = pd.DataFrame(results)
 
@@ -244,9 +229,8 @@ def write_to_file(results):
     df.to_excel("benchmark_results_asr_realtime.xlsx", index=False)
 
 
-# =========================
+
 # MAIN
-# =========================
 async def main():
     folders = list_s3_subfolders()
     results = []
