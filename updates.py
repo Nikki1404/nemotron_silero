@@ -37,3 +37,20 @@ KeyError: "None of [Index(['filename', 'silero-latency', 'custom-vad-latency', '
 
 
 why getting this ?
+
+for nemotron_silero 
+getting this in logs 
+2026-02-27 10:11:42,793 | DEBUG | ASR_SERVER | VAD | p=0.000 speaking=False
+2026-02-27 10:11:42,794 | DEBUG | ASR_SERVER | VAD | p=0.000 speaking=False
+2026-02-27 10:11:42,848 | DEBUG | ASR_SERVER | VAD | p=0.000 speaking=False
+2026-02-27 10:11:43,254 | ERROR | ASR_SERVER | WS | ERROR: Cannot call "receive" once a disconnect message has been received.
+Traceback (most recent call last):
+  File "/app/server.py", line 156, in ws_asr
+    msg = await ws.receive()
+  File "/usr/local/lib/python3.10/dist-packages/starlette/websockets.py", line 57, in receive
+    raise RuntimeError('Cannot call "receive" once a disconnect message has been received.')
+RuntimeError: Cannot call "receive" once a disconnect message has been received.
+INFO:     connection closed
+
+
+i don't think wav file is sending in realtime because in logs there is no transcription 
