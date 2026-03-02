@@ -1,56 +1,25 @@
-(nemo_env) root@EC03-E01-AICOE1:/home/CORP/re_nikitav/nemotron_silero/benchmarking# python benchmarking.py
-  0%|                                                                                                         | 0/15 [00:00<?, ?it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0000/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
-  7%|██████▍                                                                                          | 1/15 [00:00<00:01,  9.31it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0001/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
-Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0002/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 20%|███████████████████▍                                                                             | 3/15 [00:00<00:01,  9.48it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0003/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 27%|█████████████████████████▊                                                                       | 4/15 [00:00<00:01,  8.79it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0004/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 33%|████████████████████████████████▎                                                                | 5/15 [00:00<00:01,  6.84it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0005/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 40%|██████████████████████████████████████▊                                                          | 6/15 [00:00<00:01,  7.18it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0006/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 47%|█████████████████████████████████████████████▎                                                   | 7/15 [00:00<00:01,  7.49it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0007/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 53%|███████████████████████████████████████████████████▋                                             | 8/15 [00:01<00:00,  7.81it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0008/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
-Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0009/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 67%|████████████████████████████████████████████████████████████████                                | 10/15 [00:01<00:00,  8.17it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0010/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 73%|██████████████████████████████████████████████████████████████████████▍                         | 11/15 [00:01<00:00,  8.47it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0011/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 80%|████████████████████████████████████████████████████████████████████████████▊                   | 12/15 [00:01<00:00,  8.80it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0012/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
- 87%|███████████████████████████████████████████████████████████████████████████████████▏            | 13/15 [00:01<00:00,  8.76it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0013/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
-Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0014/ [Errno 111] Connect call failed ('127.0.0.1', 8000)
-100%|████████████████████████████████████████████████████████████████████████████████████████████████| 15/15 [00:01<00:00,  8.56it/s]
-Traceback (most recent call last):
-  File "/home/CORP/re_nikitav/nemotron_silero/benchmarking/benchmarking.py", line 250, in <module>
-    asyncio.run(main())
-  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
-    return loop.run_until_complete(main)
-  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
-    return future.result()
-  File "/home/CORP/re_nikitav/nemotron_silero/benchmarking/benchmarking.py", line 246, in main
-    write_to_file(results)
-  File "/home/CORP/re_nikitav/nemotron_silero/benchmarking/benchmarking.py", line 213, in write_to_file
-    df = df[[
-  File "/home/CORP/re_nikitav/nemotron_silero/benchmarking/nemo_env/lib/python3.10/site-packages/pandas/core/frame.py", line 4119, in __getitem__
-    indexer = self.columns._get_indexer_strict(key, "columns")[1]
-  File "/home/CORP/re_nikitav/nemotron_silero/benchmarking/nemo_env/lib/python3.10/site-packages/pandas/core/indexes/base.py", line 6212, in _get_indexer_strict
-    self._raise_if_missing(keyarr, indexer, axis_name)
-  File "/home/CORP/re_nikitav/nemotron_silero/benchmarking/nemo_env/lib/python3.10/site-packages/pandas/core/indexes/base.py", line 6261, in _raise_if_missing
-    raise KeyError(f"None of [{key}] are in the [{axis_name}]")
-KeyError: "None of [Index(['filename', 'silero-latency', 'custom-vad-latency', 'silero-wer',\n       'custom-vad-wer', 'reference-text', 'silero-text', 'custom-vad-text',\n       'normalized-silero-wer', 'normalized-custom-vad-wer',\n       'normalized-reference-text', 'normalized-sielro-text',\n       'normalized-custom-vad-text'],\n      dtype='object')] are in the [columns]"
-(nemo_env) root@EC03-E01-AICOE1:/home/CORP/re_nikitav/nemotron_silero/benchmarking#
+Nemotron + Custom VAD vs Nemotron + Silero — Summary
 
+Accuracy
+Custom VAD mean WER ≈ 0.11
+Silero mean WER ≈ 0.33
+Approximately 66% relative improvement with Custom VAD
 
-why getting this ?
+Normalized Accuracy
+Custom VAD remains ~3× better after normalization
+Improvement is not due to punctuation or formatting differences
 
-for nemotron_silero 
-getting this in logs 
-2026-02-27 10:11:42,793 | DEBUG | ASR_SERVER | VAD | p=0.000 speaking=False
-2026-02-27 10:11:42,794 | DEBUG | ASR_SERVER | VAD | p=0.000 speaking=False
-2026-02-27 10:11:42,848 | DEBUG | ASR_SERVER | VAD | p=0.000 speaking=False
-2026-02-27 10:11:43,254 | ERROR | ASR_SERVER | WS | ERROR: Cannot call "receive" once a disconnect message has been received.
-Traceback (most recent call last):
-  File "/app/server.py", line 156, in ws_asr
-    msg = await ws.receive()
-  File "/usr/local/lib/python3.10/dist-packages/starlette/websockets.py", line 57, in receive
-    raise RuntimeError('Cannot call "receive" once a disconnect message has been received.')
-RuntimeError: Cannot call "receive" once a disconnect message has been received.
-INFO:     connection closed
+Latency
+Both systems average around 9.8 seconds
+No meaningful latency difference observed
 
+Stability
+Custom VAD performed better in 10 out of 15 files
+Silero showed multiple high-error cases (WER = 1.0)
 
-i don't think wav file is sending in realtime because in logs there is no transcription 
+Technical Observation
+Silero tends to segment speech earlier, which can negatively affect RNNT decoding context
+Custom VAD maintains longer, cleaner utterance segments, leading to more consistent transcription quality
+
+Next Steps
+Further tuning and segmentation control on top of Silero VAD may reduce the current accuracy gap. I can investigate whether threshold calibration, buffering adjustments, and segmentation refinements bring its performance closer to the custom VAD approach.
