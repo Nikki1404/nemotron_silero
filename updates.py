@@ -13,7 +13,7 @@ from tqdm import tqdm
 from whisper_normalizer.english import EnglishTextNormalizer
 
 # SERVER ENDPOINT
-URL_CUSTOM_VAD = "ws://127.0.0.1:8002/asr/realtime-custom-vad"
+URL_SILERO = "ws://127.0.0.1:8000/ws"
 
 BUCKET = "cx-speech"
 PREFIX = "asr-realtime/benchmarking-data-3/"
@@ -79,9 +79,13 @@ def iter_wav_chunks_from_bytes(wav_bytes: bytes):
             yield data
 
 
-# CUSTOM VAD SERVER (TTFB)
-async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
-    async with websockets.connect(URL_CUSTOM_VAD, max_size=None) as ws:
+def silence_bytes(sec: float) -> bytes:
+    return b"\x00\x00" * int(TARGET_SR * sec)
+
+
+# SILERO SERVER (TTFB)
+async def transcribe_ws_silero(wav_bytes: bytes) -> Tuple[str, int]:
+    async with websockets.connect(URL_SILERO, max_size=None) as ws:
 
         finals = []
         final_received = asyncio.Event()
@@ -94,6 +98,7 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
             async for msg in ws:
                 obj = json.loads(msg)
 
+                # TTFB = first partial/final received - first audio sent
                 if obj.get("type") in ["partial", "final"] and ttfb_ms is None and first_audio_sent is not None:
                     ttfb_ms = int((time.time() - first_audio_sent) * 1000)
 
@@ -104,8 +109,8 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
 
         recv_task = asyncio.create_task(receiver())
 
-        # REQUIRED INIT MESSAGE (your server requires this)
-        await ws.send(json.dumps({"backend": "nemotron", "sample_rate": TARGET_SR}))
+        # Config
+        await ws.send(json.dumps({"type": "config", "sample_rate": TARGET_SR}))
 
         # Stream audio
         for i, chunk in enumerate(iter_wav_chunks_from_bytes(wav_bytes)):
@@ -114,13 +119,16 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
             await ws.send(chunk)
             await asyncio.sleep(CHUNK_MS / 1000.0)
 
-        # EOS
-        await ws.send(b"")
+        # IMPORTANT for your updated silero server: post-roll completion
+        await ws.send(silence_bytes(1.2))
+        for _ in range(5):
+            await ws.send(b"\x00\x00" * CHUNK_FRAMES)
+            await asyncio.sleep(CHUNK_MS / 1000.0)
 
         try:
             await asyncio.wait_for(final_received.wait(), timeout=25)
         except asyncio.TimeoutError:
-            print("Custom VAD timeout waiting for final")
+            print("Silero timeout waiting for final")
 
         await ws.close()
         recv_task.cancel()
@@ -152,22 +160,22 @@ async def process_folder(folder_prefix: str):
     wav_bytes = get_s3_object_bytes(wav_key)
     reference_text = get_s3_object_bytes(txt_key).decode("utf-8")
 
-    custom_text, custom_ttfb = await transcribe_ws_custom_vad(wav_bytes)
+    silero_text, silero_ttfb = await transcribe_ws_silero(wav_bytes)
 
     normalized_reference = normalize(reference_text)
-    normalized_custom = normalize(custom_text)
+    normalized_silero = normalize(silero_text)
 
     return {
         "filename": folder_prefix.split("/")[-2],
-        "custom_vad_latency(ttfb_ms)": custom_ttfb,
+        "silero_latency(ttfb_ms)": silero_ttfb,
 
-        "custom-vad-wer": calculate_wer(reference_text, custom_text),
+        "silero-wer": calculate_wer(reference_text, silero_text),
         "reference-text": reference_text,
-        "custom-vad-text": custom_text,
+        "silero-text": silero_text,
 
-        "normalized-custom-vad-wer": calculate_wer(normalized_reference, normalized_custom),
+        "normalized-silero-wer": calculate_wer(normalized_reference, normalized_silero),
         "normalized-reference-text": normalized_reference,
-        "normalized-custom-vad-text": normalized_custom,
+        "normalized-sielro-text": normalized_silero,  # keep spelling as you used
     }
 
 
@@ -180,17 +188,17 @@ def write_to_file(results):
 
     df = df[[
         "filename",
-        "custom_vad_latency(ttfb_ms)",
-        "custom-vad-wer",
+        "silero_latency(ttfb_ms)",
+        "silero-wer",
         "reference-text",
-        "custom-vad-text",
-        "normalized-custom-vad-wer",
+        "silero-text",
+        "normalized-silero-wer",
         "normalized-reference-text",
-        "normalized-custom-vad-text",
+        "normalized-sielro-text",
     ]]
 
-    df.to_excel("benchmark_custom_vad_only.xlsx", index=False)
-    print("Saved: benchmark_custom_vad_only.xlsx")
+    df.to_excel("benchmark_silero_only.xlsx", index=False)
+    print("Saved: benchmark_silero_only.xlsx")
 
 
 # MAIN
