@@ -273,52 +273,79 @@ async def ws_asr(ws: WebSocket):
           
 
 #server.py(nemotron_custom_vad)
+import asyncio
 import json
 import time
 import logging
-from typing import Optional
 import os
-import wave
-import uuid
-
-# ADDED
 import numpy as np
 import resampy
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import Response
-from fastapi.websockets import WebSocketDisconnect
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
-from app.config import load_config
+from app.config import load_config, Config, MODEL_MAP
 from app.metrics import *
 from app.vad import AdaptiveEnergyVAD
-from app.nemotron_streaming import NemotronStreamingASR
+from app.factory import build_engine
+from app.asr_engines.base import ASREngine
 
 cfg = load_config()
-logging.basicConfig(level=cfg.log_level)
+logging.basicConfig(level=cfg.log_level, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("asr_server")
 
 app = FastAPI()
-engine: Optional[NemotronStreamingASR] = None
+ENGINE_CACHE: dict[str, ASREngine] = {}
 
+#  PRELOAD BOTH MODELS AT STARTUP (takes ~30-60s once)
+async def preload_engines():
+    """Preload both Whisper + Nemotron models into cache"""
+    backends = ["whisper", "nemotron", "google"]
+    
+    log.info(" Preloading ASR engines (this happens once at startup)...")
+    for backend in backends:
+        try:
+            model_name = MODEL_MAP[backend]
+            print(f"   Loading {backend} ({model_name})...")
+            
+            tmp_cfg = Config()
+            object.__setattr__(tmp_cfg, 'asr_backend', backend)
+            object.__setattr__(tmp_cfg, 'model_name', model_name)
+            object.__setattr__(tmp_cfg, 'device', cfg.device)
+            object.__setattr__(tmp_cfg, 'sample_rate', cfg.sample_rate)
+            object.__setattr__(tmp_cfg, 'context_right', cfg.context_right)
+             
+            os.environ["https_proxy"] = "http://163.116.128.80:8080"
+            os.environ["http_proxy"] = "http://163.116.128.80:8080"
+            
+            engine = build_engine(tmp_cfg)
+            load_sec = engine.load()
+            
+            os.environ.pop("https_proxy", None)
+            os.environ.pop("http_proxy", None)
+            
+            log.info(f" Preloaded {backend} ({model_name}) in {load_sec:.2f}s")
+            ENGINE_CACHE[backend] = engine
+            
+        except Exception as e:
+            log.error(f" Failed to preload {backend}: {e}")
+            continue
+    
+    log.info(" All engines preloaded! Client requests will be INSTANT.")
 
+#  STARTUP EVENT - Preload happens automatically
 @app.on_event("startup")
-async def startup():
-    global engine
-    engine = NemotronStreamingASR(
-        model_name=cfg.model_name,
-        device=cfg.device,
-        sample_rate=cfg.sample_rate,
-        context_right=cfg.context_right,
-    )
-    load_sec = engine.load()
-    log.info(f"Loaded model={cfg.model_name} in {load_sec:.2f}s on {cfg.device}")
+async def startup_event():
+    await preload_engines()
 
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
+def get_engine(backend: str) -> ASREngine:
+    """Instant lookup from preloaded cache"""
+    if backend not in ENGINE_CACHE:
+        raise ValueError(f"Engine '{backend}' not preloaded. Available: {list(ENGINE_CACHE.keys())}")
+    
+    log.info(f" Using cached {backend} engine (0ms latency!)")
+    return ENGINE_CACHE[backend]
 
 
 @app.get("/metrics")
@@ -326,94 +353,22 @@ async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.websocket("/ws/asr")
+@app.websocket("/asr/realtime-custom-vad")
 async def ws_asr(ws: WebSocket):
-    assert engine is not None
+    await ws.accept()
 
-    session_id = uuid.uuid4().hex[:8]
+    #  FIRST MESSAGE MUST BE CONFIG
+    init = await ws.receive_text()
+    init_obj = json.loads(init)
 
-    ws_open = False
-
-    # ADDED: per-connection sample rate (default = 16k)
-    client_sample_rate = cfg.sample_rate
-
-    try:
-        await ws.accept()
-        ws_open = True
-    except Exception as e:
-        log.error(f"WS accept failed: {e}")
+    backend = init_obj.get("backend")
+    if backend not in ("nemotron", "whisper", "google"):
+        await ws.close(code=4000)
         return
+    
+    client_sample_rate = init_obj.get("sample_rate", cfg.sample_rate)
 
-    ACTIVE_STREAMS.inc()
-    log.info(f"WS connected: {ws.client} session={session_id}")
 
-    vad = AdaptiveEnergyVAD(
-        cfg.sample_rate,
-        cfg.vad_frame_ms,
-        cfg.vad_start_margin,
-        cfg.vad_min_noise_rms,
-        cfg.pre_speech_ms,
-    )
-
-    session = engine.new_session(max_buffer_ms=cfg.max_buffer_ms)
-
-    utt_started = False
-    utt_audio_ms = 0
-    t_start = None
-    t_first_partial = None
-    silence_ms = 0
-
-    frame_bytes = int(cfg.sample_rate * (cfg.vad_frame_ms / 1000.0) * 2)
-    pcm_buffer = bytearray()
-    received_pcm = bytearray()
-
-    def reset_utt_state():
-        nonlocal utt_started, utt_audio_ms, t_start, t_first_partial, silence_ms
-        vad.reset()
-        utt_started = False
-        utt_audio_ms = 0
-        t_start = None
-        t_first_partial = None
-        silence_ms = 0
-
-    async def safe_send_text(payload: str) -> bool:
-        nonlocal ws_open
-        if not ws_open:
-            return False
-        try:
-            await ws.send_text(payload)
-            return True
-        except (WebSocketDisconnect, RuntimeError) as e:
-            ws_open = False
-            log.warning(f"WS send failed (closed): {e}")
-            return False
-        except Exception as e:
-            ws_open = False
-            log.warning(f"WS send failed (unknown): {e}")
-            return False
-
-    def dump_received_audio():
-        if not received_pcm:
-            return
-
-        debug_dir = getattr(cfg, "debug_audio_dir", "./debug_audio")
-        os.makedirs(debug_dir, exist_ok=True)
-
-        wav_path = os.path.join(
-            debug_dir,
-            f"ws_{session_id}_{int(time.time() * 1000)}.wav"
-        )
-
-        with wave.open(wav_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(cfg.sample_rate)
-            wf.writeframes(received_pcm)
-
-        log.info(f"[ASR][DEBUG][{session_id}] WAV dumped → {wav_path}")
-        received_pcm.clear()
-
-    # ADDED: upsample helper (only used if client is 8k)
     def upsample_if_needed(pcm: bytes) -> bytes:
         if not pcm or client_sample_rate == cfg.sample_rate:
             return pcm
@@ -423,126 +378,95 @@ async def ws_asr(ws: WebSocket):
         y = np.clip(y, -1.0, 1.0)
         return (y * 32767.0).astype(np.int16).tobytes()
 
-    async def finalize_and_emit(reason: str):
-        nonlocal utt_started, utt_audio_ms, t_start, t_first_partial, silence_ms
 
-        if not utt_started:
-            return
+    engine = get_engine(backend)
 
-        snap_chunks = int(getattr(session, "chunks", 0))
-        snap_preproc = float(getattr(session, "utt_preproc", 0.0))
-        snap_infer = float(getattr(session, "utt_infer", 0.0))
+    labels = (backend, engine.model_name)
 
-        flush_t0 = time.perf_counter()
-        final = session.finalize(cfg.finalize_pad_ms).strip()
-        flush_wall = time.perf_counter() - flush_t0
+    active_streams = ACTIVE_STREAMS.labels(*labels)
+    partials_total = PARTIALS_TOTAL.labels(*labels)
+    finals_total = FINALS_TOTAL.labels(*labels)
+    utterances_total = UTTERANCES_TOTAL.labels(*labels)
 
-        dump_received_audio()
+    ttft_wall = TTFT_WALL.labels(*labels)
+    ttf_wall = TTF_WALL.labels(*labels)
 
-        UTTERANCES_TOTAL.inc()
-        FINALS_TOTAL.inc()
+    infer_sec = INFER_SEC.labels(*labels)
+    preproc_sec = PREPROC_SEC.labels(*labels)
+    flush_sec = FLUSH_SEC.labels(*labels)
 
-        now = time.time()
-        ttf_sec = (now - t_start) if t_start else 0.0
-        TTF_WALL.observe(ttf_sec)
+    audio_sec_hist = AUDIO_SEC.labels(*labels)
+    rtf_hist = RTF.labels(*labels)
+    backlog_ms_gauge = BACKLOG_MS.labels(*labels)
 
-        if t_first_partial and t_start:
-            TTFT_WALL.observe(t_first_partial - t_start)
+    active_streams.inc()
+    log.info(f"WS connected ({backend}) {ws.client}")
 
-        audio_sec = utt_audio_ms / 1000.0
-        AUDIO_SEC.observe(audio_sec)
+    vad = AdaptiveEnergyVAD(
+        cfg.sample_rate,
+        cfg.vad_frame_ms,
+        cfg.vad_start_margin,
+        cfg.vad_min_noise_rms,
+        cfg.pre_speech_ms,
+    )
 
-        PREPROC_SEC.observe(snap_preproc)
-        INFER_SEC.observe(snap_infer)
-        FLUSH_SEC.observe(flush_wall)
+    session = engine.new_session(max_buffer_ms=cfg.max_utt_ms)
 
-        rtf = None
-        if audio_sec > 0:
-            rtf = snap_infer / audio_sec
-            RTF.observe(rtf)
+    frame_bytes = int(cfg.sample_rate * cfg.vad_frame_ms / 1000) * 2
+    raw_buf = bytearray()
 
-        payload = {
-            "type": "final",
-            "text": final,
-            "reason": reason,
-            "audio_ms": utt_audio_ms,
-            "ttft_ms": int((t_first_partial - t_start) * 1000) if (t_first_partial and t_start) else None,
-            "ttf_ms": int(ttf_sec * 1000),
-            "rtf": rtf,
-            "chunks": snap_chunks,
-            "preproc_ms": int(snap_preproc * 1000),
-            "infer_ms": int(snap_infer * 1000),
-            "flush_ms": int(flush_wall * 1000),
-        }
-
-        log.info(
-            f"[ASR][FINAL][{session_id}] reason={reason} audio_ms={utt_audio_ms} "
-            f"text='{final}'"
-        )
-
-        await safe_send_text(json.dumps(payload))
-        reset_utt_state()
+    utt_started = False
+    utt_audio_ms = 0
+    t_utt_start = None
+    t_first_partial = None
+    silence_ms = 0
 
     try:
         while True:
-            try:
-                msg = await ws.receive()
-            except WebSocketDisconnect:
-                ws_open = False
-                await finalize_and_emit("disconnect")
-                break
-            except Exception as e:
-                log.error(f"WS receive failed: {e}")
-                ws_open = False
-                await finalize_and_emit("receive_error")
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
                 break
 
-            # ADDED: handshake parser
-            if msg.get("text"):
-                try:
-                    meta = json.loads(msg["text"])
-                    if meta.get("type") == "start" and "sample_rate" in meta:
-                        client_sample_rate = int(meta["sample_rate"])
-                        log.info(
-                            f"[ASR][{session_id}] Client sample rate set to {client_sample_rate}Hz"
-                        )
-                        continue
-                except Exception:
-                    pass
-
-            pcm = msg.get("bytes")
-
-            if pcm is None:
+            data = msg.get("bytes")
+            if data is None:
                 continue
+            data = upsample_if_needed(data)
 
-            pcm = upsample_if_needed(pcm)
-
-            if pcm:
-                received_pcm.extend(pcm)
-
-            if pcm == b"":
-                ws_open = False
-                await finalize_and_emit("eos")
+            if data == b"":
+                if utt_started:
+                    final = session.finalize(cfg.post_speech_pad_ms)
+                    await _emit_final(
+                        ws,
+                        session,
+                        final,
+                        utt_audio_ms,
+                        t_utt_start,
+                        t_first_partial,
+                        "eos",
+                        utterances_total,
+                        finals_total,
+                        ttf_wall,
+                        audio_sec_hist,
+                        rtf_hist,
+                        engine,
+                    )
                 break
 
-            pcm_buffer.extend(pcm)
+            raw_buf.extend(data)
 
-            while len(pcm_buffer) >= frame_bytes:
-                frame = bytes(pcm_buffer[:frame_bytes])
-                del pcm_buffer[:frame_bytes]
+            while len(raw_buf) >= frame_bytes:
+                frame = bytes(raw_buf[:frame_bytes])
+                del raw_buf[:frame_bytes]
 
                 is_speech, pre = vad.push_frame(frame)
-
-                if is_speech:
-                    silence_ms = 0
-                else:
-                    silence_ms += cfg.vad_frame_ms
+                silence_ms = 0 if is_speech else silence_ms + cfg.vad_frame_ms
 
                 if pre and not utt_started:
                     utt_started = True
                     utt_audio_ms = 0
-                    t_start = time.time()
+                    t_utt_start = time.time()
                     t_first_partial = None
+                    silence_ms = 0
                     session.accept_pcm16(pre)
 
                 if not utt_started:
@@ -551,39 +475,102 @@ async def ws_asr(ws: WebSocket):
                 session.accept_pcm16(frame)
                 utt_audio_ms += cfg.vad_frame_ms
 
-                text = session.step_if_ready()
-                if text:
-                    if t_first_partial is None:
-                        t_first_partial = time.time()
+                if engine.caps.partials:
+                    text = session.step_if_ready()
+                    if text:
+                        partials_total.inc()
+                        if t_first_partial is None:
+                            t_first_partial = time.time()
+                            if engine.caps.ttft_meaningful:
+                                ttft_wall.observe(t_first_partial - t_utt_start)
 
-                    PARTIALS_TOTAL.inc()
-                    log.debug(f"[ASR][PARTIAL][{session_id}] {text}")
+                        log.info(f"CLIENT: {ws.client}, TEXT: {text}, START_TIME : {int(t_utt_start * 1000)}")
+                        await ws.send_text(json.dumps({
+                            "type": "partial", 
+                            "text": text,
+                            "t_start": int(t_utt_start * 1000)
+                        }))
 
-                    ok = await safe_send_text(json.dumps({"type": "partial", "text": text}))
-                    if not ok:
-                        ws_open = False
-                        break
-
-                should_finalize = (
-                    silence_ms >= cfg.end_silence_ms
+                if (
+                    not is_speech
                     and utt_audio_ms >= cfg.min_utt_ms
-                )
-
-                if utt_audio_ms >= cfg.max_utt_ms:
-                    should_finalize = True
-
-                if should_finalize:
-                    reason = "pause" if silence_ms >= cfg.end_silence_ms else "max_utt"
-                    await finalize_and_emit(reason)
-
-            if not ws_open:
-                break
+                    and silence_ms >= cfg.end_silence_ms
+                ):
+                    final = session.finalize(cfg.post_speech_pad_ms)
+                    await _emit_final(
+                        ws,
+                        session,
+                        final,
+                        utt_audio_ms,
+                        t_utt_start,
+                        t_first_partial,
+                        "silence",
+                        utterances_total,
+                        finals_total,
+                        ttf_wall,
+                        audio_sec_hist,
+                        rtf_hist,
+                        engine,
+                    )
+                    vad.reset()
+                    utt_started = False
+                    utt_audio_ms = 0
+                    silence_ms = 0
 
     finally:
-        ACTIVE_STREAMS.dec()
-        if ws_open:
-            try:
-                await ws.close()
-            except Exception:
-                pass
-        log.info(f"WS disconnected session={session_id}")
+        active_streams.dec()
+        await ws.close()
+        log.info("WS disconnected")
+
+
+async def _emit_final(
+    ws,
+    session,
+    final_text,
+    audio_ms,
+    t_start,
+    t_first_partial,
+    reason,
+    utterances_total,
+    finals_total,
+    ttf_wall,
+    audio_sec_hist,
+    rtf_hist,
+    engine,
+):
+    if not final_text:
+        return
+
+    utterances_total.inc()
+    finals_total.inc()
+
+    audio_sec = audio_ms / 1000.0
+    ttf = time.time() - t_start
+
+    ttf_wall.observe(ttf)
+    audio_sec_hist.observe(audio_sec)
+
+    compute_sec = session.utt_preproc + session.utt_infer + session.utt_flush
+    if audio_sec > 0:
+        rtf_hist.observe(compute_sec / audio_sec)
+
+    log.info(f"CLIENT: {ws.client}, TEXT: {final_text}")
+
+    await ws.send_text(json.dumps({
+        "type": "final",
+        "text": final_text,
+        "reason": reason,
+        "t_start": int(t_start * 1000),
+        "audio_ms": audio_ms,
+        "ttf_ms": int(ttf * 1000),
+        "ttft_ms": (
+            int((t_first_partial - t_start) * 1000)
+            if t_first_partial and engine.caps.ttft_meaningful
+            else None
+        ),
+        "chunks": session.chunks,
+        "model_preproc_ms": int(session.utt_preproc * 1000),
+        "model_infer_ms": int(session.utt_infer * 1000),
+        "model_flush_ms": int(session.utt_flush * 1000),
+        "rtf": (compute_sec / audio_sec) if audio_sec > 0 else None,
+    }))
