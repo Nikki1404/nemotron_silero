@@ -12,8 +12,7 @@ import pandas as pd
 from tqdm import tqdm
 from whisper_normalizer.english import EnglishTextNormalizer
 
-# SERVER ENDPOINTS
-URL_SILERO = "ws://127.0.0.1:8000/ws"
+# SERVER ENDPOINT
 URL_CUSTOM_VAD = "ws://127.0.0.1:8002/asr/realtime-custom-vad"
 
 BUCKET = "cx-speech"
@@ -80,68 +79,7 @@ def iter_wav_chunks_from_bytes(wav_bytes: bytes):
             yield data
 
 
-def silence_bytes(sec: float) -> bytes:
-    return b"\x00\x00" * int(TARGET_SR * sec)
-
-
-# SILERO SERVER
-async def transcribe_ws_silero(wav_bytes: bytes) -> Tuple[str, int]:
-    async with websockets.connect(URL_SILERO, max_size=None) as ws:
-
-        finals = []
-        final_received = asyncio.Event()
-
-        first_audio_sent = None
-        ttfb_ms = None
-
-        async def receiver():
-            nonlocal ttfb_ms
-            async for msg in ws:
-                obj = json.loads(msg)
-
-                if obj.get("type") in ["partial", "final"] and ttfb_ms is None:
-                    ttfb_ms = int((time.time() - first_audio_sent) * 1000)
-
-                if obj.get("type") == "final":
-                    if obj.get("text"):
-                        finals.append(obj["text"].strip())
-                    final_received.set()
-
-        recv_task = asyncio.create_task(receiver())
-
-        await ws.send(json.dumps({"type": "config", "sample_rate": TARGET_SR}))
-
-        for i, chunk in enumerate(iter_wav_chunks_from_bytes(wav_bytes)):
-
-            if i == 0:
-                first_audio_sent = time.time()
-
-            await ws.send(chunk)
-            await asyncio.sleep(CHUNK_MS / 1000.0)
-
-        # Send silence
-        await ws.send(silence_bytes(1.2))
-
-        # Send additional frames so post-roll completes
-        for _ in range(5):
-            await ws.send(b"\x00\x00" * CHUNK_FRAMES)
-            await asyncio.sleep(CHUNK_MS / 1000.0)
-
-        try:
-            await asyncio.wait_for(final_received.wait(), timeout=20)
-        except asyncio.TimeoutError:
-            print("Silero timeout waiting for final")
-
-        await ws.close()
-        recv_task.cancel()
-
-        if ttfb_ms is None:
-            ttfb_ms = -1
-
-        return " ".join(finals), ttfb_ms
-
-
-# CUSTOM VAD SERVER
+# CUSTOM VAD SERVER (TTFB)
 async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
     async with websockets.connect(URL_CUSTOM_VAD, max_size=None) as ws:
 
@@ -156,7 +94,7 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
             async for msg in ws:
                 obj = json.loads(msg)
 
-                if obj.get("type") in ["partial", "final"] and ttfb_ms is None:
+                if obj.get("type") in ["partial", "final"] and ttfb_ms is None and first_audio_sent is not None:
                     ttfb_ms = int((time.time() - first_audio_sent) * 1000)
 
                 if obj.get("type") == "final":
@@ -166,20 +104,21 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
 
         recv_task = asyncio.create_task(receiver())
 
-        await ws.send(json.dumps({"backend": "nemotron"}))
+        # REQUIRED INIT MESSAGE (your server requires this)
+        await ws.send(json.dumps({"backend": "nemotron", "sample_rate": TARGET_SR}))
 
+        # Stream audio
         for i, chunk in enumerate(iter_wav_chunks_from_bytes(wav_bytes)):
-
             if i == 0:
                 first_audio_sent = time.time()
-
             await ws.send(chunk)
             await asyncio.sleep(CHUNK_MS / 1000.0)
 
+        # EOS
         await ws.send(b"")
 
         try:
-            await asyncio.wait_for(final_received.wait(), timeout=20)
+            await asyncio.wait_for(final_received.wait(), timeout=25)
         except asyncio.TimeoutError:
             print("Custom VAD timeout waiting for final")
 
@@ -194,16 +133,18 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
 
 # PROCESS ONE AUDIO FOLDER
 async def process_folder(folder_prefix: str):
-    objects = s3.list_objects_v2(Bucket=BUCKET, Prefix=folder_prefix)["Contents"]
+    resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=folder_prefix)
+    contents = resp.get("Contents", [])
 
     wav_key = None
     txt_key = None
 
-    for obj in objects:
-        if obj["Key"].endswith(".wav"):
-            wav_key = obj["Key"]
-        if obj["Key"].endswith(".txt"):
-            txt_key = obj["Key"]
+    for obj in contents:
+        k = obj["Key"]
+        if k.endswith(".wav"):
+            wav_key = k
+        elif k.endswith(".txt"):
+            txt_key = k
 
     if not wav_key or not txt_key:
         return None
@@ -211,31 +152,21 @@ async def process_folder(folder_prefix: str):
     wav_bytes = get_s3_object_bytes(wav_key)
     reference_text = get_s3_object_bytes(txt_key).decode("utf-8")
 
-    silero_text, silero_latency = await transcribe_ws_silero(wav_bytes)
-    custom_text, custom_latency = await transcribe_ws_custom_vad(wav_bytes)
+    custom_text, custom_ttfb = await transcribe_ws_custom_vad(wav_bytes)
 
     normalized_reference = normalize(reference_text)
-    normalized_silero = normalize(silero_text)
     normalized_custom = normalize(custom_text)
 
     return {
         "filename": folder_prefix.split("/")[-2],
+        "custom_vad_latency(ttfb_ms)": custom_ttfb,
 
-        "silero_latency(ttfb_ms)": silero_latency,
-        "custom_vad_latency(ttfb_ms)": custom_latency,
-
-        "silero-wer": calculate_wer(reference_text, silero_text),
         "custom-vad-wer": calculate_wer(reference_text, custom_text),
-
         "reference-text": reference_text,
-        "silero-text": silero_text,
         "custom-vad-text": custom_text,
 
-        "normalized-silero-wer": calculate_wer(normalized_reference, normalized_silero),
         "normalized-custom-vad-wer": calculate_wer(normalized_reference, normalized_custom),
-
         "normalized-reference-text": normalized_reference,
-        "normalized-sielro-text": normalized_silero,
         "normalized-custom-vad-text": normalized_custom,
     }
 
@@ -243,23 +174,23 @@ async def process_folder(folder_prefix: str):
 # WRITE XLSX
 def write_to_file(results):
     df = pd.DataFrame(results)
+    if df.empty:
+        print("No results generated")
+        return
+
     df = df[[
         "filename",
-        "silero_latency(ttfb_ms)",
         "custom_vad_latency(ttfb_ms)",
-        "silero-wer",
         "custom-vad-wer",
         "reference-text",
-        "silero-text",
         "custom-vad-text",
-        "normalized-silero-wer",
         "normalized-custom-vad-wer",
         "normalized-reference-text",
-        "normalized-sielro-text",
         "normalized-custom-vad-text",
     ]]
 
-    df.to_excel("benchmark_nemotron_sileroVScustom_vad.xlsx", index=False)
+    df.to_excel("benchmark_custom_vad_only.xlsx", index=False)
+    print("Saved: benchmark_custom_vad_only.xlsx")
 
 
 # MAIN
