@@ -1,19 +1,3 @@
 U/zUSxrAsRqqbxt2SSkgg=="
 (nemo_env) root@EC03-E01-AICOE1:/home/CORP/re_nikitav/nemotron_silero/benchmarking# python benchmarking.py
-  0%|                                                                                                         | 0/15 [00:00<?, ?it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0000/ proxy rejected connection: HTTP 400
-  7%|██████▍                                                                                          | 1/15 [00:00<00:03,  3.92it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0001/ proxy rejected connection: HTTP 400
- 13%|████████████▉                                                                                    | 2/15 [00:00<00:03,  4.29it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0002/ proxy rejected connection: HTTP 400
- 20%|███████████████████▍                                                                             | 3/15 [00:00<00:02,  4.44it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0003/ proxy rejected connection: HTTP 400
- 27%|█████████████████████████▊                                                                       | 4/15 [00:00<00:02,  4.46it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0004/ proxy rejected connection: HTTP 400
- 33%|████████████████████████████████▎                                                                | 5/15 [00:01<00:02,  4.15it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0005/ proxy rejected connection: HTTP 400
- 40%|██████████████████████████████████████▊                                                          | 6/15 [00:01<00:02,  4.38it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0006/ proxy rejected connection: HTTP 400
- 47%|█████████████████████████████████████████████▎                                                   | 7/15 [00:01<00:01,  4.58it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0007/ proxy rejected connection: HTTP 400
- 53%|███████████████████████████████████████████████████▋                                             | 8/15 [00:01<00:01,  4.54it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0008/ proxy rejected connection: HTTP 400
- 60%|██████████████████████████████████████████████████████████▏                                      | 9/15 [00:01<00:01,  4.75it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0009/ proxy rejected connection: HTTP 400
- 67%|████████████████████████████████████████████████████████████████                                | 10/15 [00:02<00:01,  4.61it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0010/ proxy rejected connection: HTTP 400
- 73%|██████████████████████████████████████████████████████████████████████▍                         | 11/15 [00:02<00:00,  4.61it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0011/ proxy rejected connection: HTTP 400
- 80%|████████████████████████████████████████████████████████████████████████████▊                   | 12/15 [00:02<00:00,  4.61it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0012/ proxy rejected connection: HTTP 400
- 87%|███████████████████████████████████████████████████████████████████████████████████▏            | 13/15 [00:02<00:00,  4.69it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0013/ proxy rejected connection: HTTP 400
- 93%|█████████████████████████████████████████████████████████████████████████████████████████▌      | 14/15 [00:03<00:00,  4.85it/s]Error in folder: asr-realtime/benchmarking-data-3/1272_1281041272-128104-0014/ proxy rejected connection: HTTP 400
-100%|████████████████████████████████████████████████████████████████████████████████████████████████| 15/15 [00:03<00:00,  4.45it/s]
-No results produced.
+ s3://cx-speech/asr-realtime/benchmarking-data-3/
