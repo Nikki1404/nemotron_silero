@@ -1,319 +1,317 @@
+import asyncio
 import json
 import time
-import logging
-from dataclasses import dataclass
-from typing import Optional, Any
+import wave
+import io
+from typing import Tuple
 
-import numpy as np
-import torch
-import resampy
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
-import nemo.collections.asr as nemo_asr
-
-# ===============================
-# LOGGING
-# ===============================
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s | %(levelname)-5s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("ASR_SERVER")
+import boto3
+import websockets
+import jiwer
+import pandas as pd
+from tqdm import tqdm
+from whisper_normalizer.english import EnglishTextNormalizer
 
 # ===============================
-# CONFIG
+# SERVER ENDPOINTS
 # ===============================
-SR = 16000
+URL_SILERO = "ws://127.0.0.1:8000/ws"
+URL_CUSTOM_VAD = "ws://127.0.0.1:8002/asr/realtime-custom-vad"
 
-# Partial behavior (sliding window)
-# (Recommended for better latency/stability vs 6s @ 0.35s, but keep if you want)
-PARTIAL_EVERY_S = 0.60
-PARTIAL_WINDOW_S = 4.0
+BUCKET = "cx-speech"
+PREFIX = "asr-realtime/benchmarking-data-3/"
 
-# VAD
-VAD_FRAME_SAMPLES = 512     # 32ms @ 16k
-VAD_START_TH = 0.45         # speech start threshold (after smoothing)
-VAD_END_TH = 0.25           # speech end threshold (after smoothing)
-MIN_SILENCE_MS = 800        # slightly less aggressive endpointing for read speech
-MAX_UTT_S = 20.0
+TARGET_SR = 16000
+CHUNK_MS = 80
+CHUNK_FRAMES = int(TARGET_SR * CHUNK_MS / 1000)
 
-# Safety: Nemotron often needs enough speech audio to output text
-MIN_UTT_AUDIO_MS_FOR_ASR = 700  # reduce empty/blank outputs
+s3 = boto3.client("s3")
+whisper_norm = EnglishTextNormalizer()
 
-# Padding to avoid missing first/last words (big WER win vs Silero default)
-PRE_ROLL_MS = 250
-POST_ROLL_MS = 350
-PRE_ROLL_SAMPLES = int(SR * PRE_ROLL_MS / 1000)
-POST_ROLL_SAMPLES = int(SR * POST_ROLL_MS / 1000)
-
-# Smooth Silero probability to reduce chattering / early end
-EMA_ALPHA = 0.90  # higher = smoother (0.85-0.95 typical)
-
-MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-app = FastAPI()
+# ===============================
+# TEXT NORMALIZATION
+# ===============================
+def normalize(txt):
+    return whisper_norm(txt or "")
 
 
-@app.get("/health")
-def health():
-    return {"ok": True, "device": DEVICE, "model": MODEL_NAME, "sr": SR}
+transform = jiwer.Compose([
+    jiwer.ToLowerCase(),
+    jiwer.RemovePunctuation(),
+    jiwer.RemoveMultipleSpaces(),
+    jiwer.Strip(),
+    jiwer.ReduceToListOfListOfWords(word_delimiter=" "),
+])
+
+
+def calculate_wer(reference_str: str, hypothesis_str: str) -> float:
+    return jiwer.wer(
+        reference=reference_str,
+        hypothesis=hypothesis_str,
+        reference_transform=transform,
+        hypothesis_transform=transform
+    )
 
 
 # ===============================
-# NeMo output -> plain string
+# S3 HELPERS
 # ===============================
-def nemo_to_text(x: Any) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, str):
-        return x
-    if hasattr(x, "text"):
-        try:
-            return x.text or ""
-        except Exception:
-            return ""
-    if isinstance(x, (list, tuple)):
-        if len(x) == 0:
-            return ""
-        return nemo_to_text(x[0])
-    return str(x)
+def list_s3_subfolders():
+    paginator = s3.get_paginator("list_objects_v2")
+    result = paginator.paginate(
+        Bucket=BUCKET,
+        Prefix=PREFIX,
+        Delimiter="/"
+    )
+
+    folders = []
+    for page in result:
+        for prefix in page.get("CommonPrefixes", []):
+            folders.append(prefix["Prefix"])
+
+    return folders
 
 
-def transcribe_text(audio_f32: np.ndarray) -> str:
-    """Always returns a string, never Hypothesis."""
-    if audio_f32.size == 0:
-        return ""
-    with torch.no_grad():
-        out = asr_model.transcribe([audio_f32], batch_size=1)
-    return nemo_to_text(out).strip()
+def get_s3_object_bytes(key: str) -> bytes:
+    obj = s3.get_object(Bucket=BUCKET, Key=key)
+    return obj["Body"].read()
 
 
-def pcm16_rms_db(pcm16: np.ndarray) -> float:
-    if pcm16.size == 0:
-        return -120.0
-    x = pcm16.astype(np.float32) / 32768.0
-    rms = float(np.sqrt(np.mean(x * x) + 1e-12))
-    db = 20.0 * np.log10(rms + 1e-12)
-    return db
-
-
-def upsample_if_needed(pcm: bytes, client_sample_rate: int) -> bytes:
-    """
-    Resample client audio to server SR (16k) if needed.
-    """
-    if not pcm or client_sample_rate == SR:
-        return pcm
-
-    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    y = resampy.resample(x, client_sample_rate, SR)
-    y = np.clip(y, -1.0, 1.0)
-    return (y * 32767.0).astype(np.int16).tobytes()
-
-
-# ===============================
-# Load ASR
-# ===============================
-logger.info("INIT | Loading Nemotron...")
-asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME).to(DEVICE).eval()
-logger.info(f"INIT | Model class: {asr_model.__class__.__name__} | DEVICE={DEVICE}")
-
-logger.info("INIT | Warming up...")
-dummy = np.zeros(SR, dtype=np.float32)  # 1s
-warm = transcribe_text(dummy)
-logger.info(f"INIT | Warmup done. (warmup_text='{warm}')")
-
-# ===============================
-# Load Silero VAD (CPU)
-# ===============================
-logger.info("INIT | Loading Silero VAD...")
-vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
-vad_model.to("cpu").eval()
-logger.info("INIT | Silero ready.")
-
-
-def silero_prob_32ms(frame_pcm16: np.ndarray) -> float:
-    audio = frame_pcm16.astype(np.float32) / 32768.0
-    with torch.no_grad():
-        return float(vad_model(torch.from_numpy(audio), SR).item())
-
-
-@dataclass
-class VADState:
-    speaking: bool = False
-    silence_ms: int = 0
-    utt_start_t: Optional[float] = None
-
-
-@app.websocket("/ws")
-async def ws_asr(ws: WebSocket):
-    await ws.accept()
-    logger.info("WS | Client connected")
-
-    vad_state = VADState()
-    vad_buf = np.zeros((0,), dtype=np.int16)
-    speech_buf = np.zeros((0,), dtype=np.int16)
-
-    # New buffers for improved Silero integration
-    pre_roll_buf = np.zeros((0,), dtype=np.int16)
-    post_roll_remaining = 0
-    p_smooth = 0.0
-
-    last_partial_text = ""
-    last_partial_ts = 0.0
-    last_audio_log_ts = 0.0
-
-    # default client rate unless client sends config
-    client_sample_rate = SR
-
-    try:
+def iter_wav_chunks_from_bytes(wav_bytes: bytes):
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
         while True:
-            msg = await ws.receive()
+            data = wf.readframes(CHUNK_FRAMES)
+            if not data:
+                break
+            yield data
 
-            if "bytes" in msg and msg["bytes"] is not None:
-                data = msg["bytes"]
-            elif "text" in msg and msg["text"] is not None:
-                # Allow a config message from client: {"type":"config","sample_rate":48000}
-                try:
-                    meta = json.loads(msg["text"])
-                    if isinstance(meta, dict) and meta.get("type") == "config":
-                        client_sample_rate = int(meta.get("sample_rate", SR))
-                        logger.info(f"WS | Client sample_rate set to {client_sample_rate}")
-                    continue
-                except Exception:
-                    continue
-            else:
-                continue
 
-            # upsample if needed
-            data = upsample_if_needed(data, client_sample_rate)
+def silence_bytes(sec: float) -> bytes:
+    return b"\x00\x00" * int(TARGET_SR * sec)
 
-            chunk = np.frombuffer(data, dtype=np.int16)
 
-            # Maintain rolling pre-roll buffer always (big WER win)
-            pre_roll_buf = np.concatenate([pre_roll_buf, chunk])
-            if pre_roll_buf.size > PRE_ROLL_SAMPLES:
-                pre_roll_buf = pre_roll_buf[-PRE_ROLL_SAMPLES:]
+# ===============================
+# SILERO SERVER
+# ===============================
+async def transcribe_ws_silero(wav_bytes: bytes) -> Tuple[str, int]:
 
-            # periodic audio-level log (confirms mic is not silent)
-            now = time.time()
-            if now - last_audio_log_ts >= 1.0:
-                last_audio_log_ts = now
-                logger.debug(
-                    f"AUDIO | recv_bytes={len(data)} rms_db={pcm16_rms_db(chunk):.1f}dB (client_sr={client_sample_rate})"
-                )
+    print("Connecting to Silero:", URL_SILERO)
 
-            # Always append to VAD buffer
-            vad_buf = np.concatenate([vad_buf, chunk])
+    async with websockets.connect(URL_SILERO, max_size=None) as ws:
 
-            # Collect speech when in speaking OR during post-roll
-            if vad_state.speaking:
-                speech_buf = np.concatenate([speech_buf, chunk])
-            elif post_roll_remaining > 0:
-                take = min(post_roll_remaining, chunk.size)
-                if take > 0:
-                    speech_buf = np.concatenate([speech_buf, chunk[:take]])
-                    post_roll_remaining -= take
-                if post_roll_remaining <= 0:
-                    logger.info("VAD | POST_ROLL complete -> FINALIZE")
-                    end_utt = True
-                else:
-                    end_utt = False
-            else:
-                end_utt = False
+        finals = []
+        final_received = asyncio.Event()
 
-            # ---- VAD ----
-            while len(vad_buf) >= VAD_FRAME_SAMPLES:
-                frame = vad_buf[:VAD_FRAME_SAMPLES]
-                vad_buf = vad_buf[VAD_FRAME_SAMPLES:]
+        first_audio_sent = None
+        ttfb_ms = None
 
-                p_raw = silero_prob_32ms(frame)
-                # EMA smoothing
-                p_smooth = EMA_ALPHA * p_smooth + (1.0 - EMA_ALPHA) * p_raw
-                p = p_smooth
+        async def receiver():
+            nonlocal ttfb_ms
 
-                frame_ms = int(1000 * (VAD_FRAME_SAMPLES / SR))
-                tnow = time.time()
+            async for msg in ws:
+                obj = json.loads(msg)
 
-                logger.debug(f"VAD | p={p:.3f} (raw={p_raw:.3f}) speaking={vad_state.speaking} post_roll={post_roll_remaining}")
+                # Calculate TTFB
+                if ttfb_ms is None and first_audio_sent is not None:
+                    if obj.get("type") in ["partial", "final"]:
+                        ttfb_ms = int((time.time() - first_audio_sent) * 1000)
 
-                if not vad_state.speaking and post_roll_remaining <= 0:
-                    if p >= VAD_START_TH:
-                        vad_state.speaking = True
-                        vad_state.silence_ms = 0
-                        vad_state.utt_start_t = tnow
+                if obj.get("type") == "final":
+                    if obj.get("text"):
+                        finals.append(obj["text"].strip())
+                    final_received.set()
 
-                        # Prepend pre-roll so we don't miss first words
-                        speech_buf = pre_roll_buf.copy()
+        recv_task = asyncio.create_task(receiver())
 
-                        last_partial_text = ""
-                        last_partial_ts = 0.0
-                        logger.info("VAD | SPEECH_START (with pre-roll)")
-                elif vad_state.speaking:
-                    if p <= VAD_END_TH:
-                        vad_state.silence_ms += frame_ms
-                        if vad_state.silence_ms >= MIN_SILENCE_MS:
-                            # Stop speaking, begin post-roll instead of immediate finalize
-                            vad_state.speaking = False
-                            post_roll_remaining = POST_ROLL_SAMPLES
-                            logger.info("VAD | SPEECH_END (post-roll started)")
-                    else:
-                        vad_state.silence_ms = 0
+        await ws.send(json.dumps({
+            "type": "config",
+            "sample_rate": TARGET_SR
+        }))
 
-                    if vad_state.utt_start_t and (tnow - vad_state.utt_start_t) >= MAX_UTT_S:
-                        vad_state.speaking = False
-                        post_roll_remaining = 0
-                        end_utt = True
-                        logger.info("VAD | MAX_UTT_END -> FINALIZE")
+        for i, chunk in enumerate(iter_wav_chunks_from_bytes(wav_bytes)):
+            if i == 0:
+                first_audio_sent = time.time()
 
-            # ---- PARTIAL ----
-            if (
-                vad_state.speaking
-                and speech_buf.size > 0
-                and (time.time() - last_partial_ts) >= PARTIAL_EVERY_S
-            ):
-                last_partial_ts = time.time()
+            await ws.send(chunk)
+            await asyncio.sleep(CHUNK_MS / 1000.0)
 
-                utt_ms = int(1000 * (speech_buf.size / SR))
-                if utt_ms < MIN_UTT_AUDIO_MS_FOR_ASR:
-                    logger.debug(f"ASR | PARTIAL skip (utt_ms={utt_ms} < {MIN_UTT_AUDIO_MS_FOR_ASR})")
-                else:
-                    max_samples = int(PARTIAL_WINDOW_S * SR)
-                    use_pcm = speech_buf[-max_samples:] if speech_buf.size > max_samples else speech_buf
-                    audio_f32 = use_pcm.astype(np.float32) / 32768.0
+        await ws.send(silence_bytes(0.7))
 
-                    text = transcribe_text(audio_f32)
-                    logger.debug(f"ASR | PARTIAL window_ms={int(1000*use_pcm.size/SR)} text='{text}'")
+        await asyncio.wait_for(final_received.wait(), timeout=60)
 
-                    if text and text != last_partial_text:
-                        last_partial_text = text
-                        await ws.send_text(json.dumps({"type": "partial", "text": text}))
+        if ttfb_ms is None:
+            ttfb_ms = -1
 
-            # ---- FINAL ----
-            if end_utt:
-                utt_ms = int(1000 * (speech_buf.size / SR))
-                if utt_ms < MIN_UTT_AUDIO_MS_FOR_ASR:
-                    final_text = ""
-                    logger.info(f"ASR | FINAL skipped (utt_ms={utt_ms} too short)")
-                else:
-                    audio_f32 = speech_buf.astype(np.float32) / 32768.0
-                    final_text = transcribe_text(audio_f32)
-                    logger.info(f"ASR | FINAL utt_ms={utt_ms} text='{final_text}'")
+        await ws.close()
+        recv_task.cancel()
 
-                await ws.send_text(json.dumps({"type": "final", "text": final_text}))
+        return " ".join(finals), ttfb_ms
 
-                # reset
-                speech_buf = np.zeros((0,), dtype=np.int16)
-                vad_state = VADState()
-                post_roll_remaining = 0
-                last_partial_text = ""
-                last_partial_ts = 0.0
 
-    except WebSocketDisconnect:
-        logger.info("WS | Client disconnected")
-    except Exception as e:
-        logger.exception(f"WS | ERROR: {e}")
+# ===============================
+# CUSTOM VAD SERVER
+# ===============================
+async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
+
+    print("Connecting to Custom VAD:", URL_CUSTOM_VAD)
+
+    async with websockets.connect(URL_CUSTOM_VAD, max_size=None) as ws:
+
+        finals = []
+        final_received = asyncio.Event()
+
+        first_audio_sent = None
+        ttfb_ms = None
+
+        async def receiver():
+            nonlocal ttfb_ms
+
+            async for msg in ws:
+                obj = json.loads(msg)
+
+                # Calculate TTFB
+                if ttfb_ms is None and first_audio_sent is not None:
+                    if obj.get("type") in ["partial", "final"]:
+                        ttfb_ms = int((time.time() - first_audio_sent) * 1000)
+
+                if obj.get("type") == "final":
+                    if obj.get("text"):
+                        finals.append(obj["text"].strip())
+                    final_received.set()
+
+        recv_task = asyncio.create_task(receiver())
+
+        # Init handshake
+        await ws.send(json.dumps({"backend": "nemotron"}))
+
+        for i, chunk in enumerate(iter_wav_chunks_from_bytes(wav_bytes)):
+            if i == 0:
+                first_audio_sent = time.time()
+
+            await ws.send(chunk)
+            await asyncio.sleep(CHUNK_MS / 1000.0)
+
+        await ws.send(b"")
+
+        await asyncio.wait_for(final_received.wait(), timeout=60)
+
+        if ttfb_ms is None:
+            ttfb_ms = -1
+
+        await ws.close()
+        recv_task.cancel()
+
+        return " ".join(finals), ttfb_ms
+
+
+# ===============================
+# PROCESS ONE AUDIO FOLDER
+# ===============================
+async def process_folder(folder_prefix: str):
+
+    objects = s3.list_objects_v2(
+        Bucket=BUCKET,
+        Prefix=folder_prefix
+    )["Contents"]
+
+    wav_key = None
+    txt_key = None
+
+    for obj in objects:
+        if obj["Key"].endswith(".wav"):
+            wav_key = obj["Key"]
+        if obj["Key"].endswith(".txt"):
+            txt_key = obj["Key"]
+
+    if not wav_key or not txt_key:
+        return None
+
+    wav_bytes = get_s3_object_bytes(wav_key)
+    reference_text = get_s3_object_bytes(txt_key).decode("utf-8")
+
+    silero_text, silero_ttfb = await transcribe_ws_silero(wav_bytes)
+    custom_text, custom_ttfb = await transcribe_ws_custom_vad(wav_bytes)
+
+    normalized_reference = normalize(reference_text)
+    normalized_silero = normalize(silero_text)
+    normalized_custom = normalize(custom_text)
+
+    return {
+        "filename": folder_prefix.split("/")[-2],
+
+        "silero-ttfb(ms)": silero_ttfb,
+        "custom-vad-ttfb(ms)": custom_ttfb,
+
+        "silero-wer": calculate_wer(reference_text, silero_text),
+        "custom-vad-wer": calculate_wer(reference_text, custom_text),
+
+        "reference-text": reference_text,
+        "silero-text": silero_text,
+        "custom-vad-text": custom_text,
+
+        "normalized-silero-wer": calculate_wer(
+            normalized_reference,
+            normalized_silero
+        ),
+
+        "normalized-custom-vad-wer": calculate_wer(
+            normalized_reference,
+            normalized_custom
+        ),
+
+        "normalized-reference-text": normalized_reference,
+        "normalized-sielro-text": normalized_silero,
+        "normalized-custom-vad-text": normalized_custom,
+    }
+
+
+# ===============================
+# WRITE RESULTS
+# ===============================
+def write_to_file(results):
+
+    df = pd.DataFrame(results)
+
+    df = df[[
+        "filename",
+        "silero-ttfb(ms)",
+        "custom-vad-ttfb(ms)",
+        "silero-wer",
+        "custom-vad-wer",
+        "reference-text",
+        "silero-text",
+        "custom-vad-text",
+        "normalized-silero-wer",
+        "normalized-custom-vad-wer",
+        "normalized-reference-text",
+        "normalized-sielro-text",
+        "normalized-custom-vad-text",
+    ]]
+
+    df.to_excel("benchmark_results_asr_realtime.xlsx", index=False)
+
+
+# ===============================
+# MAIN
+# ===============================
+async def main():
+
+    folders = list_s3_subfolders()
+    results = []
+
+    for folder in tqdm(folders):
+
         try:
-            await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
-        except Exception:
-            pass
+            result = await process_folder(folder)
+
+            if result:
+                results.append(result)
+
+        except Exception as e:
+            print("Error in folder:", folder, e)
+
+    write_to_file(results)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
