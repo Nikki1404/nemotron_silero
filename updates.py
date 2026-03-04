@@ -13,7 +13,7 @@ from tqdm import tqdm
 from whisper_normalizer.english import EnglishTextNormalizer
 
 # SERVER ENDPOINTS
-URL_SILERO = "ws://127.0.0.1:8000/ws"
+URL_SILERO = "ws://127.0.0.1:8082/ws"
 URL_CUSTOM_VAD = "ws://127.0.0.1:8002/asr/realtime-custom-vad"
 
 BUCKET = "cx-speech"
@@ -90,11 +90,19 @@ async def transcribe_ws_silero(wav_bytes: bytes) -> Tuple[str, int]:
 
         finals = []
         final_received = asyncio.Event()
-        t_start = time.time()
+
+        first_audio_sent = None
+        ttfb_ms = None
 
         async def receiver():
+            nonlocal ttfb_ms
             async for msg in ws:
                 obj = json.loads(msg)
+
+                # measure TTFB
+                if obj.get("type") in ["partial", "final"] and ttfb_ms is None:
+                    ttfb_ms = int((time.time() - first_audio_sent) * 1000)
+
                 if obj.get("type") == "final":
                     if obj.get("text"):
                         finals.append(obj["text"].strip())
@@ -104,19 +112,24 @@ async def transcribe_ws_silero(wav_bytes: bytes) -> Tuple[str, int]:
 
         await ws.send(json.dumps({"type": "config", "sample_rate": TARGET_SR}))
 
-        for chunk in iter_wav_chunks_from_bytes(wav_bytes):
+        for i, chunk in enumerate(iter_wav_chunks_from_bytes(wav_bytes)):
+
+            if i == 0:
+                first_audio_sent = time.time()
+
             await ws.send(chunk)
             await asyncio.sleep(CHUNK_MS / 1000.0)
 
         await ws.send(silence_bytes(0.7))
         await asyncio.wait_for(final_received.wait(), timeout=60)
 
-        latency_ms = int((time.time() - t_start) * 1000)
-
         await ws.close()
         recv_task.cancel()
 
-        return " ".join(finals), latency_ms
+        if ttfb_ms is None:
+            ttfb_ms = -1
+
+        return " ".join(finals), ttfb_ms
 
 
 # CUSTOM VAD SERVER
@@ -125,11 +138,18 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
 
         finals = []
         final_received = asyncio.Event()
-        t_start = time.time()
+
+        first_audio_sent = None
+        ttfb_ms = None
 
         async def receiver():
+            nonlocal ttfb_ms
             async for msg in ws:
                 obj = json.loads(msg)
+
+                if obj.get("type") in ["partial", "final"] and ttfb_ms is None:
+                    ttfb_ms = int((time.time() - first_audio_sent) * 1000)
+
                 if obj.get("type") == "final":
                     if obj.get("text"):
                         finals.append(obj["text"].strip())
@@ -140,19 +160,24 @@ async def transcribe_ws_custom_vad(wav_bytes: bytes) -> Tuple[str, int]:
         # REQUIRED INIT MESSAGE
         await ws.send(json.dumps({"backend": "nemotron"}))
 
-        for chunk in iter_wav_chunks_from_bytes(wav_bytes):
+        for i, chunk in enumerate(iter_wav_chunks_from_bytes(wav_bytes)):
+
+            if i == 0:
+                first_audio_sent = time.time()
+
             await ws.send(chunk)
             await asyncio.sleep(CHUNK_MS / 1000.0)
 
         await ws.send(b"")  # EOS
         await asyncio.wait_for(final_received.wait(), timeout=60)
 
-        latency_ms = int((time.time() - t_start) * 1000)
-
         await ws.close()
         recv_task.cancel()
 
-        return " ".join(finals), latency_ms
+        if ttfb_ms is None:
+            ttfb_ms = -1
+
+        return " ".join(finals), ttfb_ms
 
 
 # PROCESS ONE AUDIO FOLDER
@@ -186,8 +211,8 @@ async def process_folder(folder_prefix: str):
     return {
         "filename": folder_prefix.split("/")[-2],
 
-        "silero-latency": silero_latency,
-        "custom-vad-latency": custom_latency,
+        "silero_latency(ttfb_ms)": silero_latency,
+        "custom_vad_latency(ttfb_ms)": custom_latency,
 
         "silero-wer": calculate_wer(reference_text, silero_text),
         "custom-vad-wer": calculate_wer(reference_text, custom_text),
@@ -200,7 +225,7 @@ async def process_folder(folder_prefix: str):
         "normalized-custom-vad-wer": calculate_wer(normalized_reference, normalized_custom),
 
         "normalized-reference-text": normalized_reference,
-        "normalized-sielro-text": normalized_silero,  # keeping exact spelling as requested
+        "normalized-sielro-text": normalized_silero,
         "normalized-custom-vad-text": normalized_custom,
     }
 
@@ -210,8 +235,8 @@ def write_to_file(results):
     df = pd.DataFrame(results)
     df = df[[
         "filename",
-        "silero-latency",
-        "custom-vad-latency",
+        "silero_latency(ttfb_ms)",
+        "custom_vad_latency(ttfb_ms)",
         "silero-wer",
         "custom-vad-wer",
         "reference-text",
@@ -225,7 +250,6 @@ def write_to_file(results):
     ]]
 
     df.to_excel("benchmark_nemotron_sileroVScustom_vad.xlsx", index=False)
-
 
 
 # MAIN
