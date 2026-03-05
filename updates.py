@@ -1,221 +1,46 @@
-import asyncio
-import json
-import time
-import wave
-import io
-from typing import Tuple
+Improvements Done in Nemotron + Silero VAD
 
-import boto3
-import websockets
-import jiwer
-import pandas as pd
-from tqdm import tqdm
-from whisper_normalizer.english import EnglishTextNormalizer
+• Pre-roll buffering (250 ms) added to capture audio just before speech starts.
+→ Prevents missing initial phonemes of words.
 
-# SERVER ENDPOINT
-URL_SILERO = "ws://127.0.0.1:8000/ws"
+• Post-roll buffering (350 ms) added after silence detection.
+→ Ensures last words are not truncated.
 
-BUCKET = "cx-speech"
-PREFIX = "asr-realtime/benchmarking-data-3/"
+• Minimum speech duration threshold (~700 ms) implemented.
+→ Avoids sending very short noises or breaths to ASR.
 
-TARGET_SR = 16000
-CHUNK_MS = 80
-CHUNK_FRAMES = int(TARGET_SR * CHUNK_MS / 1000)
+• Improved silence detection (~800 ms) before finalizing an utterance.
+→ Creates cleaner speech segmentation.
 
-s3 = boto3.client("s3")
-whisper_norm = EnglishTextNormalizer()
+• Model preloading / caching enabled.
+→ Nemotron ASR loads once at startup, eliminating first-request latency.
 
+• More stable utterance segmentation due to VAD-driven speech boundary detection.
 
-# TEXT NORMALIZATION
-def normalize(txt):
-    return whisper_norm(txt or "")
+Benchmarking Observation
 
+Custom VAD
 
-transform = jiwer.Compose([
-    jiwer.ToLowerCase(),
-    jiwer.RemovePunctuation(),
-    jiwer.RemoveMultipleSpaces(),
-    jiwer.Strip(),
-    jiwer.ReduceToListOfListOfWords(word_delimiter=" "),
-])
+• Slightly lower latency (faster TTFB).
+• Simpler energy-based detection.
 
+Silero VAD
 
-def calculate_wer(reference_str: str, hypothesis_str: str) -> float:
-    return jiwer.wer(
-        reference=reference_str,
-        hypothesis=hypothesis_str,
-        reference_transform=transform,
-        hypothesis_transform=transform
-    )
+• Slightly higher latency due to buffering and detection logic.
+• More stable speech segmentation.
+• Reduces unnecessary ASR calls.
 
+Recommendation Based on Benchmark
 
-# S3 HELPERS
-def list_s3_subfolders():
-    paginator = s3.get_paginator("list_objects_v2")
-    result = paginator.paginate(
-        Bucket=BUCKET,
-        Prefix=PREFIX,
-        Delimiter="/"
-    )
+For scalable production systems:
 
-    folders = []
-    for page in result:
-        for prefix in page.get("CommonPrefixes", []):
-            folders.append(prefix["Prefix"])
-    return folders
+➡ Nemotron + Silero VAD is the better choice.
 
+Reason:
 
-def get_s3_object_bytes(key: str) -> bytes:
-    obj = s3.get_object(Bucket=BUCKET, Key=key)
-    return obj["Body"].read()
+• More robust speech detection.
+• Better utterance boundaries.
+• Lower ASR compute load at scale.
+• More stable performance in noisy environments.
 
-
-def iter_wav_chunks_from_bytes(wav_bytes: bytes):
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-        while True:
-            data = wf.readframes(CHUNK_FRAMES)
-            if not data:
-                break
-            yield data
-
-
-def silence_bytes(sec: float) -> bytes:
-    return b"\x00\x00" * int(TARGET_SR * sec)
-
-
-# SILERO SERVER (TTFB)
-async def transcribe_ws_silero(wav_bytes: bytes) -> Tuple[str, int]:
-    async with websockets.connect(URL_SILERO, max_size=None) as ws:
-
-        finals = []
-        final_received = asyncio.Event()
-
-        first_audio_sent = None
-        ttfb_ms = None
-
-        async def receiver():
-            nonlocal ttfb_ms
-            async for msg in ws:
-                obj = json.loads(msg)
-
-                # TTFB = first partial/final received - first audio sent
-                if obj.get("type") in ["partial", "final"] and ttfb_ms is None and first_audio_sent is not None:
-                    ttfb_ms = int((time.time() - first_audio_sent) * 1000)
-
-                if obj.get("type") == "final":
-                    if obj.get("text"):
-                        finals.append(obj["text"].strip())
-                    final_received.set()
-
-        recv_task = asyncio.create_task(receiver())
-
-        # Config
-        await ws.send(json.dumps({"type": "config", "sample_rate": TARGET_SR}))
-
-        # Stream audio
-        for i, chunk in enumerate(iter_wav_chunks_from_bytes(wav_bytes)):
-            if i == 0:
-                first_audio_sent = time.time()
-            await ws.send(chunk)
-            await asyncio.sleep(CHUNK_MS / 1000.0)
-
-        # IMPORTANT for your updated silero server: post-roll completion
-        await ws.send(silence_bytes(1.2))
-        for _ in range(5):
-            await ws.send(b"\x00\x00" * CHUNK_FRAMES)
-            await asyncio.sleep(CHUNK_MS / 1000.0)
-
-        try:
-            await asyncio.wait_for(final_received.wait(), timeout=25)
-        except asyncio.TimeoutError:
-            print("Silero timeout waiting for final")
-
-        await ws.close()
-        recv_task.cancel()
-
-        if ttfb_ms is None:
-            ttfb_ms = -1
-
-        return " ".join(finals), ttfb_ms
-
-
-# PROCESS ONE AUDIO FOLDER
-async def process_folder(folder_prefix: str):
-    resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=folder_prefix)
-    contents = resp.get("Contents", [])
-
-    wav_key = None
-    txt_key = None
-
-    for obj in contents:
-        k = obj["Key"]
-        if k.endswith(".wav"):
-            wav_key = k
-        elif k.endswith(".txt"):
-            txt_key = k
-
-    if not wav_key or not txt_key:
-        return None
-
-    wav_bytes = get_s3_object_bytes(wav_key)
-    reference_text = get_s3_object_bytes(txt_key).decode("utf-8")
-
-    silero_text, silero_ttfb = await transcribe_ws_silero(wav_bytes)
-
-    normalized_reference = normalize(reference_text)
-    normalized_silero = normalize(silero_text)
-
-    return {
-        "filename": folder_prefix.split("/")[-2],
-        "silero_latency(ttfb_ms)": silero_ttfb,
-
-        "silero-wer": calculate_wer(reference_text, silero_text),
-        "reference-text": reference_text,
-        "silero-text": silero_text,
-
-        "normalized-silero-wer": calculate_wer(normalized_reference, normalized_silero),
-        "normalized-reference-text": normalized_reference,
-        "normalized-sielro-text": normalized_silero,  # keep spelling as you used
-    }
-
-
-# WRITE XLSX
-def write_to_file(results):
-    df = pd.DataFrame(results)
-    if df.empty:
-        print("No results generated")
-        return
-
-    df = df[[
-        "filename",
-        "silero_latency(ttfb_ms)",
-        "silero-wer",
-        "reference-text",
-        "silero-text",
-        "normalized-silero-wer",
-        "normalized-reference-text",
-        "normalized-sielro-text",
-    ]]
-
-    df.to_excel("benchmark_silero_only.xlsx", index=False)
-    print("Saved: benchmark_silero_only.xlsx")
-
-
-# MAIN
-async def main():
-    folders = list_s3_subfolders()
-    results = []
-
-    for folder in tqdm(folders):
-        try:
-            result = await process_folder(folder)
-            if result:
-                results.append(result)
-        except Exception as e:
-            print("Error in folder:", folder, str(e))
-
-    write_to_file(results)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+Custom VAD may still be useful for ultra-low latency use cases, but Silero VAD is preferable for scalable real-time ASR systems.
