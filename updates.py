@@ -1,46 +1,37 @@
-Improvements Done in Nemotron + Silero VAD
+FROM python:3.11-slim
 
-• Pre-roll buffering (250 ms) added to capture audio just before speech starts.
-→ Prevents missing initial phonemes of words.
+ARG USE_PROXY=false
 
-• Post-roll buffering (350 ms) added after silence detection.
-→ Ensures last words are not truncated.
+RUN if [ "$USE_PROXY" = "true" ]; then \
+        echo " Enabling proxy"; \
+        export http_proxy="http://163.116.128.80:8080"; \
+        export https_proxy="http://163.116.128.80:8080"; \
+        ENV http_proxy="http://163.116.128.80:8080"; \
+        ENV https_proxy="http://163.116.128.80:8080"; \
+    else \
+        echo " Proxy disabled"; \
+    fi
 
-• Minimum speech duration threshold (~700 ms) implemented.
-→ Avoids sending very short noises or breaths to ASR.
+WORKDIR /srv
 
-• Improved silence detection (~800 ms) before finalizing an utterance.
-→ Creates cleaner speech segmentation.
+COPY download_model/nemotron-speech-streaming/nemotron-speech-streaming-en-0.6b.nemo nemotron-speech-streaming-en-0.6b.nemo
 
-• Model preloading / caching enabled.
-→ Nemotron ASR loads once at startup, eliminating first-request latency.
+COPY requirements.txt requirements.txt
 
-• More stable utterance segmentation due to VAD-driven speech boundary detection.
+RUN pip install --upgrade pip setuptools wheel
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
-Benchmarking Observation
+COPY app app
 
-Custom VAD
+COPY app/google_credentials.json google_credentials.json
 
-• Slightly lower latency (faster TTFB).
-• Simpler energy-based detection.
 
-Silero VAD
+ENV GOOGLE_APPLICATION_CREDENTIALS=/srv/google_credentials.json
+ENV GOOGLE_RECOGNIZER=projects/eci-ugi-digital-ccaipoc/locations/us-central1/recognizers/google-stt-default
+ENV GOOGLE_REGION=us-central1
+ENV GOOGLE_LANGUAGE=en-US
+ENV GOOGLE_MODEL=latest_short
+ENV GOOGLE_INTERIM=true
+ENV GOOGLE_EXPLICIT_DECODING=true
 
-• Slightly higher latency due to buffering and detection logic.
-• More stable speech segmentation.
-• Reduces unnecessary ASR calls.
-
-Recommendation Based on Benchmark
-
-For scalable production systems:
-
-➡ Nemotron + Silero VAD is the better choice.
-
-Reason:
-
-• More robust speech detection.
-• Better utterance boundaries.
-• Lower ASR compute load at scale.
-• More stable performance in noisy environments.
-
-Custom VAD may still be useful for ultra-low latency use cases, but Silero VAD is preferable for scalable real-time ASR systems.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002"]
