@@ -1,8 +1,3 @@
-kubectl edit deployment/asr-realtime-custom-vad -n cx-speech 
-# Please edit the object below. Lines beginning with a '#' will be ignored,
-# and an empty file will abort the edit. If an error occurs while saving this file will be
-# reopened with the relevant failures.
-#
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -41,5 +36,50 @@ spec:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
-                                                                                                                                                          1,1           Top
-
+            - matchExpressions:
+              - key: eks.amazonaws.com/nodegroup
+                operator: In
+                values:
+                - gpu-dev-k8
+      containers:
+      - env:
+        - name: gpus
+          value: all
+        image: 058264113403.dkr.ecr.us-east-1.amazonaws.com/cx-speech/asr-realtime-custom-vad:0.0.16
+        imagePullPolicy: Always
+        name: asr-realtime-custom-vad-container
+        ports:
+        - containerPort: 8002
+          protocol: TCP
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: gpu
+        operator: Equal
+        value: "true"
+status:
+  availableReplicas: 1
+  conditions:
+  - lastTransitionTime: "2026-02-06T12:02:44Z"
+    lastUpdateTime: "2026-03-11T11:21:12Z"
+    message: ReplicaSet "asr-realtime-custom-vad-6b7d946995" has successfully progressed.
+    reason: NewReplicaSetAvailable
+    status: "True"
+    type: Progressing
+  - lastTransitionTime: "2026-03-11T11:23:48Z"
+    lastUpdateTime: "2026-03-11T11:23:48Z"
+    message: Deployment has minimum availability.
+    reason: MinimumReplicasAvailable
+    status: "True"
+    type: Available
+  observedGeneration: 71
+  readyReplicas: 1
+  replicas: 1
+  updatedReplicas: 1
